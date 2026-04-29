@@ -406,6 +406,66 @@ app.patch('/api/auth/profile', async (req, res) => {
     }
 });
 
+// --- Admin Routes ---
+
+// Get pending employee applications
+app.get('/api/admin/applications/pending', async (req, res) => {
+    try {
+        const result = await ddbDocClient.send(new ScanCommand({
+            TableName: tableName,
+            FilterExpression: '#role = :role AND #status = :status',
+            ExpressionAttributeNames: {
+                '#role': 'role',
+                '#status': 'status'
+            },
+            ExpressionAttributeValues: {
+                ':role': 'employee',
+                ':status': 'pending_verification'
+            }
+        }));
+
+        res.json({ success: true, count: result.Items ? result.Items.length : 0, data: result.Items || [] });
+    } catch (err) {
+        console.error('Fetch Applications Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to fetch applications' });
+    }
+});
+
+// Approve or reject employee application
+app.post('/api/admin/applications/:phone/status', async (req, res) => {
+    try {
+        const { phone } = req.params;
+        const { status } = req.body; // 'active' or 'rejected'
+
+        if (!['active', 'rejected'].includes(status)) {
+            return res.status(400).json({ success: false, message: 'Invalid status. Must be active or rejected' });
+        }
+
+        const updateParams = {
+            TableName: tableName,
+            Key: { phone },
+            UpdateExpression: 'set #status = :status, updatedAt = :time',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: {
+                ':status': status,
+                ':time': new Date().toISOString()
+            },
+            ReturnValues: 'ALL_NEW'
+        };
+
+        const result = await ddbDocClient.send(new UpdateCommand(updateParams));
+
+        res.json({ 
+            success: true, 
+            message: `Application ${status} successfully`, 
+            user: result.Attributes 
+        });
+    } catch (err) {
+        console.error('Update Application Status Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to update application status' });
+    }
+});
+
 // Mock vehicles data - simulating tea/coffee vendors in Bangalore
 const mockVehicles = [
     {
