@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Account Deletion - Thambi Oru Tea</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary: #D35400; /* Thambi Oru Tea Orange */
+            --primary-dark: #A04000;
+            --text-dark: #2C3E50;
+            --text-light: #7F8C8D;
+            --bg-light: #F4F7F6;
+            --white: #FFFFFF;
+            --error: #E74C3C;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-light);
+            color: var(--text-dark);
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .card {
+            background: var(--white);
+            max-width: 450px;
+            width: 100%;
+            padding: 40px;
+            border-radius: 16px;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+
+        .logo {
+            font-size: 24px;
+            font-weight: 800;
+            color: var(--primary);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 30px;
+        }
+
+        h1 {
+            font-size: 22px;
+            margin-bottom: 12px;
+            color: var(--text-dark);
+        }
+
+        p.description {
+            color: var(--text-light);
+            font-size: 14px;
+            margin-bottom: 30px;
+            line-height: 1.5;
+        }
+
+        .form-group {
+            text-align: left;
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-dark);
+            margin-bottom: 8px;
+            margin-left: 4px;
+        }
+
+        input {
+            width: 100%;
+            padding: 14px 16px;
+            border: 2px solid #EAECEE;
+            border-radius: 10px;
+            font-family: inherit;
+            font-size: 15px;
+            transition: all 0.3s ease;
+            outline: none;
+        }
+
+        input:focus {
+            border-color: var(--primary);
+            background-color: #fff;
+            box-shadow: 0 0 0 4px rgba(211, 84, 0, 0.1);
+        }
+
+        .submit-btn {
+            width: 100%;
+            background-color: var(--primary);
+            color: var(--white);
+            border: none;
+            padding: 16px;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: background 0.3s ease;
+            margin-top: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        .submit-btn:hover {
+            background-color: var(--primary-dark);
+        }
+
+        .submit-btn:active {
+            transform: scale(0.98);
+        }
+
+        .warning-box {
+            background-color: #FDEDEC;
+            border-radius: 8px;
+            padding: 12px;
+            margin-top: 25px;
+        }
+
+        .warning-text {
+            color: var(--error);
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        footer {
+            margin-top: 30px;
+            font-size: 12px;
+            color: var(--text-light);
+        }
+
+        @media (max-width: 480px) {
+            .card {
+                padding: 30px 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <div class="logo">Thambi Oru Tea</div>
+    <h1>Account Deletion</h1>
+    <p class="description">Please enter your details below to request permanent account deletion. This will trigger an email to our support team.</p>
+
+    <form id="deletionForm">
+        <div class="form-group">
+            <label for="name">Full Name</label>
+            <input type="text" id="name" placeholder="E.g., John Doe" required>
+        </div>
+
+        <div class="form-group">
+            <label for="mobile">Mobile Number</label>
+            <input type="tel" id="mobile" placeholder="E.g., 9876543210" required pattern="[0-9]{10}">
+        </div>
+
+        <button type="submit" class="submit-btn" id="submitBtn">
+            Request Deletion
+        </button>
+    </form>
+
+    <div class="warning-box">
+        <p class="warning-text">⚠️ Note: Account deletion is permanent and cannot be undone.</p>
+    </div>
+
+    <footer>
+        &copy; 2026 Food Man – Thambi Oru Tea
+    </footer>
+</div>
+
+<script>
+    document.getElementById('deletionForm').addEventListener('submit', function(e) {
+        e.preventDefault();
+        
+        const name = document.getElementById('name').value;
+        const mobile = document.getElementById('mobile').value;
+        const email = "foodmanadmin@gmail.com";
+        const subject = encodeURIComponent("Account Deletion Request - Thambi Oru Tea");
+        
+        const body = encodeURIComponent(
+            "Hello Support Team,\n\n" +
+            "I would like to request the permanent deletion of my account for Thambi Oru Tea.\n\n" +
+            "Account Details:\n" +
+            "Name: " + name + "\n" +
+            "Mobile Number: " + mobile + "\n\n" +
+            "Please process this request within 48 hours.\n\n" +
+            "Thank you."
+        );
+
+        window.location.href = "mailto:" + email + "?subject=" + subject + "&body=" + body;
+    });
+</script>
+
+</body>
+</html>
