@@ -408,6 +408,29 @@ app.patch('/api/auth/profile', async (req, res) => {
 
 // --- Admin Routes ---
 
+// Get active employees
+app.get('/api/admin/employees/active', async (req, res) => {
+    try {
+        const result = await ddbDocClient.send(new ScanCommand({
+            TableName: tableName,
+            FilterExpression: '#role = :role AND #status = :status',
+            ExpressionAttributeNames: {
+                '#role': 'role',
+                '#status': 'status'
+            },
+            ExpressionAttributeValues: {
+                ':role': 'employee',
+                ':status': 'active'
+            }
+        }));
+
+        res.json({ success: true, count: result.Items ? result.Items.length : 0, data: result.Items || [] });
+    } catch (err) {
+        console.error('Fetch Active Employees Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to fetch active employees' });
+    }
+});
+
 // Get pending employee applications
 app.get('/api/admin/applications/pending', async (req, res) => {
     try {
