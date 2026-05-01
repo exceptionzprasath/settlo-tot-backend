@@ -182,7 +182,7 @@ app.get('/api/orders/customer/:phone', async (req, res) => {
         res.status(500).json({ success: false, message: 'Failed to fetch your orders' });
     }
 });
-const { GetCommand, PutCommand, ScanCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
+const { GetCommand, PutCommand, ScanCommand, UpdateCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
 const { PublishCommand } = require('@aws-sdk/client-sns');
 const upload = require('./middleware/upload');
 
@@ -406,21 +406,60 @@ app.patch('/api/auth/profile', async (req, res) => {
     }
 });
 
+// Get current user session
+app.get('/api/auth/me/:empId', async (req, res) => {
+    try {
+        const { empId } = req.params;
+        const result = await ddbDocClient.send(new ScanCommand({
+            TableName: tableName,
+            FilterExpression: 'empId = :empId',
+            ExpressionAttributeValues: { ':empId': empId }
+        }));
+        
+        if (result.Items && result.Items.length > 0) {
+            res.json({ success: true, employee: result.Items[0] });
+        } else {
+            res.status(404).json({ success: false, message: 'Employee not found' });
+        }
+    } catch (err) {
+        console.error('Fetch Me Error:', err);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+// Get employee stats (mock implementation)
+app.get('/api/employee/stats/:empId', async (req, res) => {
+    try {
+        // Return mock stats for now
+        res.json({
+            success: true,
+            stats: {
+                todayOrders: 0,
+                todayEarnings: 0,
+                rating: 4.8
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
 // --- Admin Routes ---
 
-// Get active employees
+// Get active and suspended employees
 app.get('/api/admin/employees/active', async (req, res) => {
     try {
         const result = await ddbDocClient.send(new ScanCommand({
             TableName: tableName,
-            FilterExpression: '#role = :role AND #status = :status',
+            FilterExpression: '#role = :role AND (#status = :status OR #status = :suspendedStatus)',
             ExpressionAttributeNames: {
                 '#role': 'role',
                 '#status': 'status'
             },
             ExpressionAttributeValues: {
                 ':role': 'employee',
-                ':status': 'active'
+                ':status': 'active',
+                ':suspendedStatus': 'suspended'
             }
         }));
 
@@ -454,14 +493,14 @@ app.get('/api/admin/applications/pending', async (req, res) => {
     }
 });
 
-// Approve or reject employee application
+// Approve, reject or suspend employee application
 app.post('/api/admin/applications/:phone/status', async (req, res) => {
     try {
         const { phone } = req.params;
-        const { status } = req.body; // 'active' or 'rejected'
+        const { status } = req.body;
 
-        if (!['active', 'rejected'].includes(status)) {
-            return res.status(400).json({ success: false, message: 'Invalid status. Must be active or rejected' });
+        if (!['active', 'rejected', 'suspended'].includes(status)) {
+            return res.status(400).json({ success: false, message: 'Invalid status. Must be active, rejected, or suspended' });
         }
 
         const updateParams = {
@@ -480,12 +519,29 @@ app.post('/api/admin/applications/:phone/status', async (req, res) => {
 
         res.json({ 
             success: true, 
-            message: `Application ${status} successfully`, 
+            message: `Employee status updated to ${status}`, 
             user: result.Attributes 
         });
     } catch (err) {
         console.error('Update Application Status Error:', err);
         res.status(500).json({ success: false, message: 'Failed to update application status' });
+    }
+});
+
+// Delete an employee
+app.delete('/api/admin/employees/:phone', async (req, res) => {
+    try {
+        const { phone } = req.params;
+        
+        await ddbDocClient.send(new DeleteCommand({
+            TableName: tableName,
+            Key: { phone }
+        }));
+        
+        res.json({ success: true, message: 'Employee deleted successfully' });
+    } catch (err) {
+        console.error('Delete Employee Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to delete employee' });
     }
 });
 
