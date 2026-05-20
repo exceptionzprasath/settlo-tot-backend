@@ -446,6 +446,27 @@ app.get('/api/employee/stats/:empId', async (req, res) => {
 
 // --- Admin Routes ---
 
+// Get all users (customers)
+app.get('/api/admin/users', async (req, res) => {
+    try {
+        const result = await ddbDocClient.send(new ScanCommand({
+            TableName: tableName,
+            FilterExpression: '#role = :role',
+            ExpressionAttributeNames: {
+                '#role': 'role'
+            },
+            ExpressionAttributeValues: {
+                ':role': 'customer'
+            }
+        }));
+
+        res.json({ success: true, count: result.Items ? result.Items.length : 0, data: result.Items || [] });
+    } catch (err) {
+        console.error('Fetch Users Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to fetch users' });
+    }
+});
+
 // Get active and suspended employees
 app.get('/api/admin/employees/active', async (req, res) => {
     try {
