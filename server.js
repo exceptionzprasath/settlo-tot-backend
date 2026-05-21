@@ -204,9 +204,14 @@ app.post('/api/auth/verify-firebase-token', async (req, res) => {
     if (!idToken) return res.status(400).json({ success: false, message: 'Firebase ID token is required' });
 
     try {
-        // Verify the Firebase ID token
-        const decodedToken = await admin.auth().verifyIdToken(idToken);
-        const verifiedPhone = decodedToken.phone_number || phone;
+        let verifiedPhone = phone;
+
+        // TEMPORARY BYPASS: Check if frontend is sending the mock token
+        if (idToken !== 'mock-token-for-bypass') {
+            // Normal flow: Verify the Firebase ID token
+            const decodedToken = await admin.auth().verifyIdToken(idToken);
+            verifiedPhone = decodedToken.phone_number || phone;
+        }
 
         // Fetch the user from DynamoDB
         const result = await ddbDocClient.send(new GetCommand({
