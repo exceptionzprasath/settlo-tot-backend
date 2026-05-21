@@ -4,6 +4,9 @@
 
 .env
 
+# Firebase Admin SDK (contains secret credentials)
+*-firebase-adminsdk-*.json
+
 # Xcode
 #
 build/

@@ -1,38 +1,69 @@
 const express = require('express');
 const cors = require('cors');
+const http = require('http');
+const { Server } = require('socket.io');
 require('dotenv').config();
 
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST", "PATCH", "DELETE"]
+    }
+});
 const PORT = process.env.PORT || 3001;
+
+app.use((req, res, next) => {
+    req.io = io;
+    next();
+});
+
+io.on('connection', (socket) => {
+    console.log('A user connected:', socket.id);
+    
+    socket.on('join', (data) => {
+        if (data && data.role === 'employee') {
+            socket.join('employees');
+            console.log(`Socket ${socket.id} joined employees room`);
+        } else if (data && data.phone) {
+            socket.join(`customer_${data.phone}`);
+            console.log(`Socket ${socket.id} joined customer_${data.phone} room`);
+        }
+    });
+
+    socket.on('disconnect', () => {
+        console.log('User disconnected:', socket.id);
+    });
+});
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-const { ddbDocClient, snsClient, tableName, ordersTable } = require('./config/awsConfig');
+const { ddbDocClient, tableName } = require('./config/awsConfig');
+const { initFirebase, getFirebaseAdmin } = require('./config/firebaseAdmin');
 const { runSetup } = require('./scripts/setupAws');
+const admin = require('firebase-admin');
 
-// --- Order Routes ---
+// Initialize Firestore
+const db = initFirebase();
+const ordersCol = db.collection('tot_orders');
 
-// Create new order
+// Create new order - saves to Firestore
 app.post('/api/orders', async (req, res) => {
     try {
+        const orderId = req.body.id || ('ORD' + Math.floor(100000 + Math.random() * 900000));
         const orderData = {
             ...req.body,
-            status: 'placed', // initial status
+            id: orderId,
+            status: 'placed',
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString()
         };
 
-        if (!orderData.id) {
-            orderData.id = 'ORD' + Math.floor(100000 + Math.random() * 900000);
-        }
-
-        await ddbDocClient.send(new PutCommand({
-            TableName: ordersTable,
-            Item: orderData
-        }));
+        await ordersCol.doc(orderId).set(orderData);
 
         res.json({ success: true, message: 'Order placed successfully', order: orderData });
     } catch (err) {
@@ -41,53 +72,24 @@ app.post('/api/orders', async (req, res) => {
     }
 });
 
-// Get nearby orders for employees (within 2km)
+// Get all placed orders (Firestore listener handles realtime; this is for one-time fetch)
 app.get('/api/orders/nearby', async (req, res) => {
     try {
-        const { lat, lng } = req.query;
-        if (!lat || !lng) {
-            return res.status(400).json({ success: false, message: 'Latitude and Longitude are required' });
-        }
-
-        const userLat = parseFloat(lat);
-        const userLng = parseFloat(lng);
-
-        // Fetch all placed orders (in a real app, use a GSI with status='placed')
-        const result = await ddbDocClient.send(new ScanCommand({
-            TableName: ordersTable,
-            FilterExpression: '#status = :status',
-            ExpressionAttributeNames: { '#status': 'status' },
-            ExpressionAttributeValues: { ':status': 'placed' }
-        }));
-
-        const nearbyOrders = result.Items.filter(order => {
-            if (!order.locationCoords) return false;
-            const distance = calculateDistance(
-                userLat,
-                userLng,
-                order.locationCoords.latitude,
-                order.locationCoords.longitude
-            );
-            return distance <= 2; // 2km radius
-        });
-
-        res.json({ success: true, count: nearbyOrders.length, data: nearbyOrders });
+        const snapshot = await ordersCol.where('status', '==', 'placed').get();
+        const orders = snapshot.docs.map(doc => doc.data());
+        res.json({ success: true, count: orders.length, data: orders });
     } catch (err) {
         console.error('Fetch Nearby Orders Error:', err);
         res.status(500).json({ success: false, message: 'Failed to fetch nearby orders' });
     }
 });
 
-// Get order by ID (for tracking)
+// Get order by ID
 app.get('/api/orders/:id', async (req, res) => {
     try {
-        const result = await ddbDocClient.send(new GetCommand({
-            TableName: ordersTable,
-            Key: { id: req.params.id }
-        }));
-
-        if (result.Item) {
-            res.json({ success: true, data: result.Item });
+        const doc = await ordersCol.doc(req.params.id).get();
+        if (doc.exists) {
+            res.json({ success: true, data: doc.data() });
         } else {
             res.status(404).json({ success: false, message: 'Order not found' });
         }
@@ -103,33 +105,28 @@ app.post('/api/orders/:id/accept', async (req, res) => {
         const { employeeId, employeeName, employeePhone, employeeAvatar } = req.body;
         const orderId = req.params.id;
 
-        // In a real app, use ConditionExpression to prevent multiple employees from accepting
-        const updateParams = {
-            TableName: ordersTable,
-            Key: { id: orderId },
-            UpdateExpression: 'set #status = :status, employeeId = :empId, employeeName = :name, employeePhone = :phone, employeeAvatar = :avatar, acceptedAt = :time, updatedAt = :time',
-            ExpressionAttributeNames: { '#status': 'status' },
-            ExpressionAttributeValues: {
-                ':status': 'confirmed',
-                ':empId': employeeId,
-                ':name': employeeName,
-                ':phone': employeePhone,
-                ':avatar': employeeAvatar || null,
-                ':time': new Date().toISOString()
-            },
-            ReturnValues: 'ALL_NEW'
+        const updateData = {
+            status: 'confirmed',
+            employeeId,
+            employeeName,
+            employeePhone,
+            employeeAvatar: employeeAvatar || null,
+            acceptedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
         };
 
-        const result = await ddbDocClient.send(new UpdateCommand(updateParams));
+        await ordersCol.doc(orderId).update(updateData);
+        const updatedDoc = await ordersCol.doc(orderId).get();
+        const updatedOrder = updatedDoc.data();
 
-        res.json({ success: true, message: 'Order accepted', data: result.Attributes });
+        res.json({ success: true, message: 'Order accepted', data: updatedOrder });
     } catch (err) {
         console.error('Accept Order Error:', err);
         res.status(500).json({ success: false, message: 'Failed to accept order' });
     }
 });
 
-// Update order status (strictly Confirmed -> Delivered)
+// Update order status (Confirmed -> Delivered)
 app.patch('/api/orders/:id/status', async (req, res) => {
     try {
         const { status } = req.body;
@@ -139,19 +136,14 @@ app.patch('/api/orders/:id/status', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Invalid status update' });
         }
 
-        const result = await ddbDocClient.send(new UpdateCommand({
-            TableName: ordersTable,
-            Key: { id: orderId },
-            UpdateExpression: 'set #status = :status, updatedAt = :time, deliveredAt = :time',
-            ExpressionAttributeNames: { '#status': 'status' },
-            ExpressionAttributeValues: {
-                ':status': 'delivered',
-                ':time': new Date().toISOString()
-            },
-            ReturnValues: 'ALL_NEW'
-        }));
+        await ordersCol.doc(orderId).update({
+            status: 'delivered',
+            updatedAt: new Date().toISOString(),
+            deliveredAt: new Date().toISOString()
+        });
 
-        res.json({ success: true, message: 'Order delivered', data: result.Attributes });
+        const updatedDoc = await ordersCol.doc(orderId).get();
+        res.json({ success: true, message: 'Order delivered', data: updatedDoc.data() });
     } catch (err) {
         console.error('Update Status Error:', err);
         res.status(500).json({ success: false, message: 'Failed to update status' });
@@ -162,32 +154,23 @@ app.patch('/api/orders/:id/status', async (req, res) => {
 app.get('/api/orders/customer/:phone', async (req, res) => {
     try {
         const { phone } = req.params;
-        
-        const result = await ddbDocClient.send(new ScanCommand({
-            TableName: ordersTable,
-            FilterExpression: 'customerPhone = :phone',
-            ExpressionAttributeValues: {
-                ':phone': phone
-            }
-        }));
-
-        // Sort by createdAt descending
-        const sortedOrders = (result.Items || []).sort((a, b) => 
-            new Date(b.createdAt) - new Date(a.createdAt)
-        );
-
-        res.json({ success: true, data: sortedOrders });
+        const snapshot = await ordersCol.where('customerPhone', '==', phone).orderBy('createdAt', 'desc').get();
+        const orders = snapshot.docs.map(doc => doc.data());
+        res.json({ success: true, data: orders });
     } catch (err) {
         console.error('Fetch Customer Orders Error:', err);
-        res.status(500).json({ success: false, message: 'Failed to fetch your orders' });
+        // Fallback without orderBy if index not ready
+        try {
+            const snapshot2 = await ordersCol.where('customerPhone', '==', phone).get();
+            const orders = snapshot2.docs.map(doc => doc.data()).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+            res.json({ success: true, data: orders });
+        } catch (err2) {
+            res.status(500).json({ success: false, message: 'Failed to fetch your orders' });
+        }
     }
 });
 const { GetCommand, PutCommand, ScanCommand, UpdateCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
-const { PublishCommand } = require('@aws-sdk/client-sns');
 const upload = require('./middleware/upload');
-
-// Temporary in-memory OTP store (phone -> {otp, timestamp})
-const otpStore = new Map();
 
 // --- Auth Routes ---
 
@@ -213,61 +196,36 @@ app.post('/api/auth/check-phone', async (req, res) => {
     }
 });
 
-// Send OTP via SNS
-app.post('/api/auth/send-otp', async (req, res) => {
-    const { phone } = req.body;
-    if (!phone) return res.status(400).json({ success: false, message: 'Phone is required' });
-
-    const otp = Math.floor(1000 + Math.random() * 9000).toString();
-    otpStore.set(phone, { otp, timestamp: Date.now() });
+// Verify Firebase Phone Auth Token (replaces send-otp + verify-otp)
+// The app uses Firebase Auth to send and verify OTP directly.
+// Once verified, Firebase gives the app an ID token which is sent here.
+app.post('/api/auth/verify-firebase-token', async (req, res) => {
+    const { idToken, phone } = req.body;
+    if (!idToken) return res.status(400).json({ success: false, message: 'Firebase ID token is required' });
 
     try {
-        const params = {
-            Message: `Your Thambioru Tea verification code is: ${otp}`,
-            PhoneNumber: phone, // Assuming phone includes country code like +91...
-        };
+        // Verify the Firebase ID token
+        const decodedToken = await admin.auth().verifyIdToken(idToken);
+        const verifiedPhone = decodedToken.phone_number || phone;
 
-        await snsClient.send(new PublishCommand(params));
-        console.log(`OTP ${otp} sent to ${phone}`);
+        // Fetch the user from DynamoDB
+        const result = await ddbDocClient.send(new GetCommand({
+            TableName: tableName,
+            Key: { phone: verifiedPhone }
+        }));
 
-        res.json({ success: true, message: 'OTP sent successfully' });
+        res.json({
+            success: true,
+            message: 'Phone verified successfully',
+            token: idToken,
+            user: result.Item || null
+        });
     } catch (err) {
-        console.error('Send OTP Error:', err);
-        // Fallback for testing: return OTP in response if SNS fails (only if debugging)
-        res.status(500).json({ success: false, message: 'Failed to send OTP via SNS' });
-    }
-});
-
-// Verify OTP
-app.post('/api/auth/verify-otp', async (req, res) => {
-    const { phone, otp } = req.body;
-    if (!phone || !otp) return res.status(400).json({ success: false, message: 'Phone and OTP required' });
-
-    const storedData = otpStore.get(phone);
-    if (!storedData) return res.status(400).json({ success: false, message: 'OTP not requested or expired' });
-
-    if (storedData.otp === otp) {
-        otpStore.delete(phone);
-        
-        try {
-            const result = await ddbDocClient.send(new GetCommand({
-                TableName: tableName,
-                Key: { phone }
-            }));
-
-            // In a real app, generate JWT here
-            res.json({ 
-                success: true, 
-                message: 'OTP verified', 
-                token: `token_${Date.now()}`, // Mock token
-                user: result.Item
-            });
-        } catch (err) {
-            console.error('Verify OTP User Fetch Error:', err);
-            res.status(500).json({ success: false, message: 'OTP verified but failed to fetch user data' });
+        console.error('Firebase Token Verification Error:', err);
+        if (err.code === 'auth/id-token-expired') {
+            return res.status(401).json({ success: false, message: 'Session expired. Please try again.' });
         }
-    } else {
-        res.status(400).json({ success: false, message: 'Invalid OTP' });
+        res.status(401).json({ success: false, message: 'Invalid or expired token' });
     }
 });
 
@@ -754,7 +712,7 @@ function toRad(deg) {
 
 // Start server
 runSetup().then(() => {
-    app.listen(PORT, () => {
+    server.listen(PORT, () => {
         console.log(`🍵 Thambioru Tea Backend running on port ${PORT}`);
         console.log(`📍 Google Maps API configured`);
         console.log(`🚗 ${mockVehicles.length} mock vehicles loaded`);
