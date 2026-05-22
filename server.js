@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
+const https = require('https');
 const { Server } = require('socket.io');
 require('dotenv').config();
 
@@ -14,26 +15,277 @@ const io = new Server(server, {
 });
 const PORT = process.env.PORT || 3001;
 
+// Helper: Geocode a string address into lat/lng using Nominatim OpenStreetMap
+function geocodeAddress(address) {
+    return new Promise((resolve) => {
+        if (!address) return resolve(null);
+        
+        const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(address)}&limit=1`;
+        
+        const options = {
+            headers: {
+                'User-Agent': 'ThambiOruTeaBackend/1.0'
+            }
+        };
+
+        https.get(url, options, (res) => {
+            let data = '';
+            res.on('data', (chunk) => { data += chunk; });
+            res.on('end', () => {
+                try {
+                    const parsed = JSON.parse(data);
+                    if (parsed && parsed.length > 0) {
+                        resolve({
+                            latitude: parseFloat(parsed[0].lat),
+                            longitude: parseFloat(parsed[0].lon)
+                        });
+                    } else {
+                        resolve(null);
+                    }
+                } catch (e) {
+                    console.error('[Geocoding] Parse error:', e.message);
+                    resolve(null);
+                }
+            });
+        }).on('error', (err) => {
+            console.error('[Geocoding] Request error:', err.message);
+            resolve(null);
+        });
+    });
+}
+
+
+// ============================================
+// LIVE RIDER DISPATCH SYSTEM
+// In-memory store of online riders
+// Map<socketId, { employeeId, employeeName, employeePhone, lat, lng, socketId, onlineSince }>
+// ============================================
+const onlineRiders = new Map();
+
+// Helper: Get all online riders as an array
+function getOnlineRidersArray() {
+    return Array.from(onlineRiders.values());
+}
+
+// Helper: Dispatch order to nearby riders within radiusKm (and send Push Notifications)
+async function dispatchToNearbyRiders(orderData) {
+    const orderLat = parseFloat(orderData.customerLocation?.latitude);
+    const orderLng = parseFloat(orderData.customerLocation?.longitude);
+
+    if (isNaN(orderLat) || isNaN(orderLng)) {
+        console.log('⚠️ Order has no customer location, broadcasting to all riders');
+        io.to('riders').emit('new_order', { order: orderData, distance: null });
+        return;
+    }
+
+    try {
+        // Query active online riders from Firestore
+        const onlineRidersCol = db.collection('online_riders');
+        const snapshot = await onlineRidersCol.where('isOnline', '==', true).get();
+        const riders = snapshot.docs.map(doc => doc.data());
+
+        console.log(`🔍 [Geofencing] Checking ${riders.length} online riders in Firestore for Order #${orderData.id}`);
+
+        let notifiedCount = 0;
+        let pushCount = 0;
+
+        for (const rider of riders) {
+            const distance = calculateDistance(orderLat, orderLng, rider.lat, rider.lng);
+            const roundedDistance = Math.round(distance * 10) / 10;
+
+            if (distance <= 3.0) {
+                // Check if rider has an active WebSocket connection
+                let isConnected = false;
+                let activeSocketId = null;
+
+                for (const [sId, activeRider] of onlineRiders.entries()) {
+                    if (activeRider.employeeId === rider.employeeId) {
+                        isConnected = true;
+                        activeSocketId = sId;
+                        break;
+                    }
+                }
+
+                // 1. Socket Broadcast if rider is active in foreground
+                if (isConnected && activeSocketId) {
+                    io.to(activeSocketId).emit('new_order', {
+                        order: { ...orderData, distance: roundedDistance, estimatedTime: Math.round(distance * 4) },
+                        distance: roundedDistance
+                    });
+                    console.log(`📍 Notified active rider ${rider.employeeName} via Socket (${roundedDistance}km away)`);
+                }
+
+                // 2. FCM Push Notification if rider has FCM Token
+                if (rider.fcmToken) {
+                    try {
+                        const message = {
+                            notification: {
+                                title: 'New Order Nearby! ☕',
+                                body: `Order #${orderData.id} is available nearby (${roundedDistance}km away). Tap to view and accept!`,
+                            },
+                            data: {
+                                orderId: orderData.id,
+                                distance: String(roundedDistance),
+                                type: 'new_order'
+                            },
+                            android: {
+                                priority: 'high',
+                                notification: {
+                                    sound: 'default',
+                                    channelId: 'default_notification_channel',
+                                    priority: 'max',
+                                    defaultSound: true,
+                                    defaultVibrateTimings: true,
+                                }
+                            },
+                            token: rider.fcmToken
+                        };
+
+                        await admin.messaging().send(message);
+                        pushCount++;
+                        console.log(`📲 Sent FCM Push Notification to ${rider.employeeName} (${roundedDistance}km away)`);
+                    } catch (fcmErr) {
+                        console.error(`❌ FCM error for rider ${rider.employeeName}:`, fcmErr.message);
+                    }
+                } else {
+                    console.log(`⚠️ Rider ${rider.employeeName} has no registered FCM token.`);
+                }
+
+                notifiedCount++;
+            } else {
+                console.log(`⏭️ Skipped rider ${rider.employeeName} (${roundedDistance}km away, outside 3km radius)`);
+            }
+        }
+
+        console.log(`📢 Order ${orderData.id}: Dispatched to ${notifiedCount} riders (${pushCount} push notifications sent)`);
+    } catch (err) {
+        console.error('Error dispatching to nearby riders:', err);
+        // Fallback: broadcast over socket to all active riders
+        io.to('riders').emit('new_order', { order: orderData, distance: null });
+    }
+}
+
 app.use((req, res, next) => {
     req.io = io;
     next();
 });
 
 io.on('connection', (socket) => {
-    console.log('A user connected:', socket.id);
-    
+    console.log('🔌 Socket connected:', socket.id);
+
+    // --- Customer joins their room ---
     socket.on('join', (data) => {
-        if (data && data.role === 'employee') {
-            socket.join('employees');
-            console.log(`Socket ${socket.id} joined employees room`);
-        } else if (data && data.phone) {
+        if (data && data.phone) {
             socket.join(`customer_${data.phone}`);
-            console.log(`Socket ${socket.id} joined customer_${data.phone} room`);
+            console.log(`👤 Customer ${data.phone} joined room customer_${data.phone}`);
         }
     });
 
+    // --- Rider goes online with location ---
+    socket.on('rider_go_online', async (data) => {
+        if (!data || !data.employeeId) return;
+
+        const riderData = {
+            employeeId: data.employeeId,
+            employeeName: data.employeeName || 'Unknown',
+            employeePhone: data.employeePhone || '',
+            lat: parseFloat(data.lat) || 0,
+            lng: parseFloat(data.lng) || 0,
+            socketId: socket.id,
+            onlineSince: new Date().toISOString(),
+            fcmToken: data.fcmToken || null
+        };
+
+        onlineRiders.set(socket.id, riderData);
+        socket.join('riders');
+        console.log(`🟢 Rider ONLINE: ${riderData.employeeName} (${riderData.employeeId}) at [${riderData.lat}, ${riderData.lng}] | Total online: ${onlineRiders.size}`);
+
+        // Sync to Firestore online_riders
+        try {
+            await db.collection('online_riders').doc(data.employeeId).set({
+                employeeId: riderData.employeeId,
+                employeeName: riderData.employeeName,
+                employeePhone: riderData.employeePhone,
+                lat: riderData.lat,
+                lng: riderData.lng,
+                fcmToken: riderData.fcmToken,
+                isOnline: true,
+                lastUpdated: new Date().toISOString()
+            }, { merge: true });
+            console.log(`🔥 [Firestore] Synced ONLINE status for Rider ${data.employeeId}`);
+        } catch (firestoreErr) {
+            console.error(`❌ [Firestore] Error syncing rider_go_online:`, firestoreErr.message);
+        }
+
+        // Broadcast updated rider count to admin
+        io.to('admin').emit('riders_update', { riders: getOnlineRidersArray(), count: onlineRiders.size });
+    });
+
+    // --- Rider updates location (every 5 seconds) ---
+    socket.on('rider_update_location', async (data) => {
+        const rider = onlineRiders.get(socket.id);
+        if (rider && data) {
+            rider.lat = parseFloat(data.lat) || rider.lat;
+            rider.lng = parseFloat(data.lng) || rider.lng;
+            onlineRiders.set(socket.id, rider);
+
+            // Sync location update to Firestore
+            try {
+                await db.collection('online_riders').doc(rider.employeeId).update({
+                    lat: rider.lat,
+                    lng: rider.lng,
+                    lastUpdated: new Date().toISOString()
+                });
+                console.log(`🔥 [Firestore] Synced location for Rider ${rider.employeeId} to [${rider.lat}, ${rider.lng}]`);
+            } catch (firestoreErr) {
+                console.error(`❌ [Firestore] Error syncing rider_update_location:`, firestoreErr.message);
+            }
+
+            // Broadcast to admin for live map
+            io.to('admin').emit('riders_update', { riders: getOnlineRidersArray(), count: onlineRiders.size });
+        }
+    });
+
+    // --- Rider goes offline ---
+    socket.on('rider_go_offline', async () => {
+        const rider = onlineRiders.get(socket.id);
+        if (rider) {
+            console.log(`🔴 Rider OFFLINE: ${rider.employeeName} (${rider.employeeId}) | Total online: ${onlineRiders.size - 1}`);
+            onlineRiders.delete(socket.id);
+            socket.leave('riders');
+
+            // Sync offline status to Firestore
+            try {
+                await db.collection('online_riders').doc(rider.employeeId).update({
+                    isOnline: false,
+                    lastUpdated: new Date().toISOString()
+                });
+                console.log(`🔥 [Firestore] Synced OFFLINE status for Rider ${rider.employeeId}`);
+            } catch (firestoreErr) {
+                console.error(`❌ [Firestore] Error syncing rider_go_offline:`, firestoreErr.message);
+            }
+
+            io.to('admin').emit('riders_update', { riders: getOnlineRidersArray(), count: onlineRiders.size });
+        }
+    });
+
+    // --- Admin joins admin room for live updates ---
+    socket.on('admin_join', () => {
+        socket.join('admin');
+        console.log(`🛡️ Admin connected: ${socket.id}`);
+        // Send current state immediately
+        socket.emit('riders_update', { riders: getOnlineRidersArray(), count: onlineRiders.size });
+    });
+
+    // --- Disconnect cleanup ---
     socket.on('disconnect', () => {
-        console.log('User disconnected:', socket.id);
+        const rider = onlineRiders.get(socket.id);
+        if (rider) {
+            console.log(`⚡ Rider disconnected: ${rider.employeeName} (${rider.employeeId}) | Total online: ${onlineRiders.size - 1}`);
+            onlineRiders.delete(socket.id);
+            io.to('admin').emit('riders_update', { riders: getOnlineRidersArray(), count: onlineRiders.size });
+        }
+        console.log('🔌 Socket disconnected:', socket.id);
     });
 });
 
@@ -51,19 +303,57 @@ const admin = require('firebase-admin');
 const db = initFirebase();
 const ordersCol = db.collection('tot_orders');
 
-// Create new order - saves to Firestore
+// Create new order - saves to Firestore + dispatches to nearby riders
 app.post('/api/orders', async (req, res) => {
     try {
         const orderId = req.body.id || ('ORD' + Math.floor(100000 + Math.random() * 900000));
+        
+        // Handle coordinate mapping if client sends locationCoords/deliveryAddress instead of customerLocation
+        let customerLocation = req.body.customerLocation || null;
+        if (!customerLocation && req.body.locationCoords) {
+            customerLocation = {
+                latitude: req.body.locationCoords.latitude,
+                longitude: req.body.locationCoords.longitude,
+                address: req.body.deliveryAddress || ''
+            };
+        }
+
+        // Coordinate normalization & automated geocoding fallback
+        if (customerLocation) {
+            const hasLat = customerLocation.latitude !== undefined && customerLocation.latitude !== null;
+            const hasLng = customerLocation.longitude !== undefined && customerLocation.longitude !== null;
+            const parsedLat = hasLat ? parseFloat(customerLocation.latitude) : NaN;
+            const parsedLng = hasLng ? parseFloat(customerLocation.longitude) : NaN;
+
+            if (isNaN(parsedLat) || isNaN(parsedLng)) {
+                console.log(`🔍 [Geocoding] Missing or invalid coordinates for order ${orderId}. Attempting to geocode address: "${customerLocation.address}"`);
+                const coords = await geocodeAddress(customerLocation.address);
+                if (coords) {
+                    customerLocation.latitude = coords.latitude;
+                    customerLocation.longitude = coords.longitude;
+                    console.log(`✅ [Geocoding] Found coords via Nominatim: [${coords.latitude}, ${coords.longitude}]`);
+                } else {
+                    console.warn(`❌ [Geocoding] Could not geocode address: "${customerLocation.address}"`);
+                }
+            } else {
+                customerLocation.latitude = parsedLat;
+                customerLocation.longitude = parsedLng;
+            }
+        }
+
         const orderData = {
             ...req.body,
             id: orderId,
+            customerLocation,
             status: 'placed',
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString()
         };
 
         await ordersCol.doc(orderId).set(orderData);
+
+        // 🚀 Dispatch to nearby riders within 3km radius
+        dispatchToNearbyRiders(orderData);
 
         res.json({ success: true, message: 'Order placed successfully', order: orderData });
     } catch (err) {
@@ -99,31 +389,81 @@ app.get('/api/orders/:id', async (req, res) => {
     }
 });
 
-// Accept order (by employee)
+// Accept order (by employee) - uses Firestore transaction to prevent double-acceptance
 app.post('/api/orders/:id/accept', async (req, res) => {
     try {
         const { employeeId, employeeName, employeePhone, employeeAvatar } = req.body;
         const orderId = req.params.id;
+        const orderRef = ordersCol.doc(orderId);
 
-        const updateData = {
-            status: 'confirmed',
-            employeeId,
-            employeeName,
-            employeePhone,
-            employeeAvatar: employeeAvatar || null,
-            acceptedAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString()
-        };
+        // Firestore transaction: ensures only ONE rider can accept
+        const updatedOrder = await db.runTransaction(async (transaction) => {
+            const orderDoc = await transaction.get(orderRef);
 
-        await ordersCol.doc(orderId).update(updateData);
-        const updatedDoc = await ordersCol.doc(orderId).get();
-        const updatedOrder = updatedDoc.data();
+            if (!orderDoc.exists) {
+                throw new Error('ORDER_NOT_FOUND');
+            }
+
+            const currentData = orderDoc.data();
+            if (currentData.status !== 'placed') {
+                throw new Error('ORDER_ALREADY_ACCEPTED');
+            }
+
+            const updateData = {
+                status: 'confirmed',
+                employeeId,
+                employeeName,
+                employeePhone,
+                employeeAvatar: employeeAvatar || null,
+                acceptedAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString()
+            };
+
+            transaction.update(orderRef, updateData);
+            return { ...currentData, ...updateData };
+        });
+
+        // ✅ Broadcast to all riders: remove this order from their list
+        io.to('riders').emit('order_accepted', { orderId });
+        console.log(`📤 Broadcasted order_accepted for ${orderId} to all riders`);
+
+        // ✅ Notify the customer: their order is confirmed with rider details
+        if (updatedOrder.customerPhone) {
+            io.to(`customer_${updatedOrder.customerPhone}`).emit('order_confirmed', {
+                orderId,
+                status: 'confirmed',
+                rider: {
+                    employeeId,
+                    employeeName,
+                    employeePhone,
+                    employeeAvatar: employeeAvatar || null,
+                },
+                order: updatedOrder,
+            });
+            console.log(`📤 Notified customer ${updatedOrder.customerPhone}: order ${orderId} confirmed by ${employeeName}`);
+        }
 
         res.json({ success: true, message: 'Order accepted', data: updatedOrder });
     } catch (err) {
+        if (err.message === 'ORDER_ALREADY_ACCEPTED') {
+            return res.status(409).json({ success: false, message: 'This order has already been accepted by another rider' });
+        }
+        if (err.message === 'ORDER_NOT_FOUND') {
+            return res.status(404).json({ success: false, message: 'Order not found' });
+        }
         console.error('Accept Order Error:', err);
         res.status(500).json({ success: false, message: 'Failed to accept order' });
     }
+});
+
+// Get online riders (for admin panel)
+app.get('/api/riders/online', (req, res) => {
+    const riders = getOnlineRidersArray();
+    res.json({
+        success: true,
+        count: riders.length,
+        data: riders
+    });
 });
 
 // Update order status (Confirmed -> Delivered)
