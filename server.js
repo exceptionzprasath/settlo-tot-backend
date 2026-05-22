@@ -869,6 +869,59 @@ app.delete('/api/admin/employees/:phone', async (req, res) => {
     }
 });
 
+// Send broadcast push notification to both apps simultaneously
+app.post('/api/admin/broadcast-notification', async (req, res) => {
+    const { title, body } = req.body;
+
+    if (!title || !body) {
+        return res.status(400).json({ success: false, message: 'Title and body are required' });
+    }
+
+    try {
+        console.log(`📣 [Broadcast] Sending unified push notification: "${title}" - "${body}"`);
+
+        const message = {
+            notification: {
+                title: title,
+                body: body,
+            },
+            topic: 'all_users',
+            android: {
+                priority: 'high',
+                notification: {
+                    sound: 'default',
+                    channelId: 'default_notification_channel',
+                    priority: 'max',
+                    defaultSound: true,
+                    defaultVibrateTimings: true,
+                }
+            },
+            data: {
+                type: 'broadcast',
+                click_action: 'FLUTTER_NOTIFICATION_CLICK',
+                title: title,
+                body: body
+            }
+        };
+
+        const response = await admin.messaging().send(message);
+        console.log('✅ [Broadcast] Successfully sent broadcast message to topic "all_users":', response);
+
+        res.json({
+            success: true,
+            message: 'Broadcast notification sent successfully to both apps!',
+            messageId: response
+        });
+    } catch (error) {
+        console.error('❌ [Broadcast] Error sending topic message:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to send broadcast notification',
+            error: error.message
+        });
+    }
+});
+
 // Mock vehicles data - simulating tea/coffee vendors in Bangalore
 const mockVehicles = [
     {
