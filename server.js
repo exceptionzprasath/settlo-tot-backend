@@ -871,19 +871,20 @@ app.delete('/api/admin/employees/:phone', async (req, res) => {
 
 // Send broadcast push notification to both apps simultaneously
 app.post('/api/admin/broadcast-notification', async (req, res) => {
-    const { title, body } = req.body;
+    const { title, body, imageUrl } = req.body;
 
     if (!title || !body) {
         return res.status(400).json({ success: false, message: 'Title and body are required' });
     }
 
     try {
-        console.log(`📣 [Broadcast] Sending unified push notification: "${title}" - "${body}"`);
+        console.log(`📣 [Broadcast] Sending unified push notification: "${title}" - "${body}"${imageUrl ? ` with image: "${imageUrl}"` : ''}`);
 
         const message = {
             notification: {
                 title: title,
                 body: body,
+                ...(imageUrl ? { image: imageUrl } : {})
             },
             topic: 'all_users',
             android: {
@@ -894,13 +895,15 @@ app.post('/api/admin/broadcast-notification', async (req, res) => {
                     priority: 'max',
                     defaultSound: true,
                     defaultVibrateTimings: true,
+                    ...(imageUrl ? { image: imageUrl } : {})
                 }
             },
             data: {
                 type: 'broadcast',
                 click_action: 'FLUTTER_NOTIFICATION_CLICK',
                 title: title,
-                body: body
+                body: body,
+                ...(imageUrl ? { imageUrl: imageUrl } : {})
             }
         };
 
