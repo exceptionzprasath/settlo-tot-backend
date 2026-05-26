@@ -587,7 +587,7 @@ app.post('/api/auth/register', upload.fields([
     { name: 'familyAadhar', maxCount: 1 }
 ]), async (req, res) => {
     try {
-        const { name, phone, mobile, instagram, facebook, email, role, empId, address, familyRelation, pin } = req.body;
+        const { name, phone, mobile, instagram, facebook, email, role, empId, address, familyRelation, pin, alternateNumber, gender, vehicleType, vehicleNumber, dateOfJoining } = req.body;
         const files = req.files;
 
         // Use mobile if phone is not provided (employee app uses 'mobile')
@@ -608,6 +608,11 @@ app.post('/api/auth/register', upload.fields([
             address,
             familyRelation,
             pin,
+            alternateNumber: alternateNumber || null,
+            gender: gender || null,
+            vehicleType: vehicleType || null,
+            vehicleNumber: vehicleNumber || null,
+            dateOfJoining: dateOfJoining || null,
             // Documents mapping (flexible)
             selfieUrl: (files && (files.selfie || files.profilePhoto)) ? (files.selfie || files.profilePhoto)[0].location : null,
             insuranceUrl: (files && files.insurance) ? files.insurance[0].location : null,
@@ -849,6 +854,36 @@ app.post('/api/admin/applications/:phone/status', async (req, res) => {
     } catch (err) {
         console.error('Update Application Status Error:', err);
         res.status(500).json({ success: false, message: 'Failed to update application status' });
+    }
+});
+
+// Reset employee PIN
+app.post('/api/admin/employees/:phone/reset-pin', async (req, res) => {
+    try {
+        const { phone } = req.params;
+        const { pin } = req.body;
+
+        if (!pin || pin.length !== 4) {
+            return res.status(400).json({ success: false, message: 'A 4-digit PIN is required' });
+        }
+
+        const updateParams = {
+            TableName: tableName,
+            Key: { phone },
+            UpdateExpression: 'set pin = :pin, updatedAt = :time',
+            ExpressionAttributeValues: {
+                ':pin': pin,
+                ':time': new Date().toISOString()
+            },
+            ReturnValues: 'ALL_NEW'
+        };
+
+        await ddbDocClient.send(new UpdateCommand(updateParams));
+
+        res.json({ success: true, message: 'PIN reset successfully' });
+    } catch (err) {
+        console.error('Reset Employee PIN Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to reset PIN' });
     }
 });
 
