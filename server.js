@@ -181,9 +181,18 @@ io.on('connection', (socket) => {
         }
     });
 
-    // --- Rider goes online with location ---
+    // --- Rider goes online with location, box & can ---
     socket.on('rider_go_online', async (data) => {
         if (!data || !data.employeeId) return;
+
+        const boxNumber = data.boxNumber || '';
+        const currentCan = data.currentCan || '';
+
+        const initialHistory = [
+            { time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), event: 'Shift Started' },
+            { time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), event: `Box ${boxNumber} Assigned` },
+            { time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), event: `Can ${currentCan} Assigned` }
+        ];
 
         const riderData = {
             employeeId: data.employeeId,
@@ -193,12 +202,20 @@ io.on('connection', (socket) => {
             lng: parseFloat(data.lng) || 0,
             socketId: socket.id,
             onlineSince: new Date().toISOString(),
-            fcmToken: data.fcmToken || null
+            fcmToken: data.fcmToken || null,
+            boxNumber,
+            currentCan,
+            teaCups: data.teaCups !== undefined ? data.teaCups : 120,
+            teasSold: data.teasSold || 0,
+            totalTeasSold: data.totalTeasSold || 0,
+            canIndex: data.canIndex || 1,
+            canRequestStatus: data.canRequestStatus || 'none',
+            canHistory: data.canHistory || initialHistory
         };
 
         onlineRiders.set(socket.id, riderData);
         socket.join('riders');
-        console.log(`🟢 Rider ONLINE: ${riderData.employeeName} (${riderData.employeeId}) at [${riderData.lat}, ${riderData.lng}] | Total online: ${onlineRiders.size}`);
+        console.log(`🟢 Rider ONLINE: ${riderData.employeeName} (${riderData.employeeId}) with box ${boxNumber}, can ${currentCan} | Total online: ${onlineRiders.size}`);
 
         // Sync to Firestore online_riders
         try {
@@ -210,6 +227,14 @@ io.on('connection', (socket) => {
                 lng: riderData.lng,
                 fcmToken: riderData.fcmToken,
                 isOnline: true,
+                boxNumber,
+                currentCan,
+                teaCups: riderData.teaCups,
+                teasSold: riderData.teasSold,
+                totalTeasSold: riderData.totalTeasSold,
+                canIndex: riderData.canIndex,
+                canRequestStatus: riderData.canRequestStatus,
+                canHistory: riderData.canHistory,
                 lastUpdated: new Date().toISOString()
             }, { merge: true });
             console.log(`🔥 [Firestore] Synced ONLINE status for Rider ${data.employeeId}`);
@@ -355,6 +380,36 @@ app.post('/api/orders', async (req, res) => {
         // 🚀 Dispatch to nearby riders within 3km radius
         dispatchToNearbyRiders(orderData);
 
+        // ⏰ 30-second order acceptance timeout
+        setTimeout(async () => {
+            try {
+                const orderRef = ordersCol.doc(orderId);
+                const doc = await orderRef.get();
+                if (doc.exists) {
+                    const currentOrder = doc.data();
+                    if (currentOrder.status === 'placed') {
+                        // Mark as unassigned
+                        await orderRef.update({
+                            status: 'unassigned',
+                            updatedAt: new Date().toISOString()
+                        });
+                        console.log(`⏰ [Order Timeout] Order #${orderId} expired without rider acceptance.`);
+                        
+                        // Notify customer via socket room
+                        io.to(`customer_${currentOrder.customerPhone}`).emit('order_status_update', {
+                            orderId,
+                            status: 'unassigned'
+                        });
+                        
+                        // Broadcast to riders to remove order from their list
+                        io.to('riders').emit('order_expired', { orderId });
+                    }
+                }
+            } catch (timeoutErr) {
+                console.error(`Error in order ${orderId} timeout:`, timeoutErr);
+            }
+        }, 30000);
+
         res.json({ success: true, message: 'Order placed successfully', order: orderData });
     } catch (err) {
         console.error('Create Order Error:', err);
@@ -483,7 +538,59 @@ app.patch('/api/orders/:id/status', async (req, res) => {
         });
 
         const updatedDoc = await ordersCol.doc(orderId).get();
-        res.json({ success: true, message: 'Order delivered', data: updatedDoc.data() });
+        const orderData = updatedDoc.data();
+
+        // ☕ Decrement employee remaining tea cups in can
+        if (orderData && orderData.employeeId) {
+            let teaCount = 0;
+            orderData.items?.forEach(item => {
+                const name = item.name.toLowerCase();
+                if (name.includes('tea') || name.includes('coffee')) {
+                    teaCount += (item.quantity || 1);
+                }
+            });
+
+            if (teaCount > 0) {
+                try {
+                    const riderRef = db.collection('online_riders').doc(orderData.employeeId);
+                    const riderDoc = await riderRef.get();
+                    if (riderDoc.exists) {
+                        const rData = riderDoc.data();
+                        const currentCups = rData.teaCups !== undefined ? rData.teaCups : 120;
+                        const newTeaCups = Math.max(0, currentCups - teaCount);
+                        const newTeasSold = (rData.teasSold || 0) + teaCount;
+                        const newTotalTeasSold = (rData.totalTeasSold || 0) + teaCount;
+
+                        await riderRef.update({
+                            teaCups: newTeaCups,
+                            teasSold: newTeasSold,
+                            totalTeasSold: newTotalTeasSold,
+                            lastUpdated: new Date().toISOString()
+                        });
+
+                        // Update in-memory map
+                        for (const [sId, activeRider] of onlineRiders.entries()) {
+                            if (activeRider.employeeId === orderData.employeeId) {
+                                activeRider.teaCups = newTeaCups;
+                                activeRider.teasSold = newTeasSold;
+                                activeRider.totalTeasSold = newTotalTeasSold;
+                                onlineRiders.set(sId, activeRider);
+                                break;
+                            }
+                        }
+
+                        console.log(`🔥 [Inventory] Decremented rider ${orderData.employeeId} by ${teaCount} cups. Now: ${newTeaCups}/120 left`);
+
+                        // Broadcast update to Admin Live view
+                        io.to('admin').emit('riders_update', { riders: getOnlineRidersArray(), count: onlineRiders.size });
+                    }
+                } catch (riderErr) {
+                    console.error('Error updating employee tea cups capacity:', riderErr);
+                }
+            }
+        }
+
+        res.json({ success: true, message: 'Order delivered', data: orderData });
     } catch (err) {
         console.error('Update Status Error:', err);
         res.status(500).json({ success: false, message: 'Failed to update status' });
@@ -884,6 +991,170 @@ app.post('/api/admin/employees/:phone/reset-pin', async (req, res) => {
     } catch (err) {
         console.error('Reset Employee PIN Error:', err);
         res.status(500).json({ success: false, message: 'Failed to reset PIN' });
+    }
+});
+
+// Rider requests next can (runs low on tea)
+app.post('/api/admin/employees/:phone/can-request', async (req, res) => {
+    try {
+        const { phone } = req.params;
+        const { eta } = req.body;
+
+        const snapshot = await db.collection('online_riders').where('employeePhone', '==', phone).get();
+        if (snapshot.empty) {
+            return res.status(404).json({ success: false, message: 'Rider is not online' });
+        }
+
+        const docRef = snapshot.docs[0].ref;
+        const riderData = snapshot.docs[0].data();
+
+        const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        let newHistory = riderData.canHistory || [];
+        newHistory.push({ time: timeStr, event: 'Requested New Can!' });
+
+        await docRef.update({
+            canRequestStatus: 'requested',
+            canRequestEta: eta || 'N/A',
+            canRequestTime: new Date().toISOString(),
+            canHistory: newHistory,
+            lastUpdated: new Date().toISOString()
+        });
+
+        // Update in-memory active sockets
+        for (const [sId, activeRider] of onlineRiders.entries()) {
+            if (activeRider.employeeId === riderData.employeeId) {
+                activeRider.canRequestStatus = 'requested';
+                activeRider.canHistory = newHistory;
+                onlineRiders.set(sId, activeRider);
+                break;
+            }
+        }
+
+        // Broadcast to admin live requests room
+        io.to('admin').emit('riders_update', { riders: getOnlineRidersArray(), count: onlineRiders.size });
+
+        res.json({ success: true, message: 'Can request sent to office' });
+    } catch (err) {
+        console.error('Can Request Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to request can' });
+    }
+});
+
+// Admin prepares next can for rider
+app.post('/api/admin/employees/:phone/can-prepared', async (req, res) => {
+    try {
+        const { phone } = req.params;
+        const { preparedCanId } = req.body;
+
+        if (!preparedCanId) {
+            return res.status(400).json({ success: false, message: 'Can Serial Number is required' });
+        }
+
+        const snapshot = await db.collection('online_riders').where('employeePhone', '==', phone).get();
+        if (snapshot.empty) {
+            return res.status(404).json({ success: false, message: 'Rider is not online' });
+        }
+
+        const docRef = snapshot.docs[0].ref;
+        const riderData = snapshot.docs[0].data();
+
+        const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        let newHistory = riderData.canHistory || [];
+        newHistory.push({ time: timeStr, event: `Can ${preparedCanId} Prepared by Office` });
+
+        await docRef.update({
+            canRequestStatus: 'prepared',
+            preparedCanId,
+            canHistory: newHistory,
+            lastUpdated: new Date().toISOString()
+        });
+
+        // Update in-memory active sockets
+        for (const [sId, activeRider] of onlineRiders.entries()) {
+            if (activeRider.employeeId === riderData.employeeId) {
+                activeRider.canRequestStatus = 'prepared';
+                activeRider.preparedCanId = preparedCanId;
+                activeRider.canHistory = newHistory;
+                onlineRiders.set(sId, activeRider);
+                break;
+            }
+        }
+
+        // Broadcast to riders and admin
+        io.to('riders').emit('can_prepared', { employeeId: riderData.employeeId, preparedCanId });
+        io.to('admin').emit('riders_update', { riders: getOnlineRidersArray(), count: onlineRiders.size });
+
+        res.json({ success: true, message: 'Can marked as prepared' });
+    } catch (err) {
+        console.error('Can Prepared Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to prepare can' });
+    }
+});
+
+// Rider receives and scans the new prepared can at office
+app.post('/api/admin/employees/:phone/can-received', async (req, res) => {
+    try {
+        const { phone } = req.params;
+        const { scannedCanId } = req.body;
+
+        if (!scannedCanId) {
+            return res.status(400).json({ success: false, message: 'Scanned Can Serial Number is required' });
+        }
+
+        const snapshot = await db.collection('online_riders').where('employeePhone', '==', phone).get();
+        if (snapshot.empty) {
+            return res.status(404).json({ success: false, message: 'Rider is not online' });
+        }
+
+        const docRef = snapshot.docs[0].ref;
+        const riderData = snapshot.docs[0].data();
+
+        if (riderData.canRequestStatus !== 'prepared') {
+            return res.status(400).json({ success: false, message: 'No prepared can is ready for you yet' });
+        }
+
+        if (riderData.preparedCanId !== scannedCanId) {
+            return res.status(400).json({ success: false, message: `Serial Number doesn't match the prepared can (${riderData.preparedCanId})` });
+        }
+
+        const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        let newHistory = riderData.canHistory || [];
+        newHistory.push({ time: timeStr, event: `Can ${scannedCanId} Assigned` });
+
+        const nextCanIndex = (riderData.canIndex || 1) + 1;
+
+        await docRef.update({
+            currentCan: scannedCanId,
+            teaCups: 120,
+            teasSold: 0,
+            canIndex: nextCanIndex,
+            canRequestStatus: 'none',
+            preparedCanId: null,
+            canHistory: newHistory,
+            lastUpdated: new Date().toISOString()
+        });
+
+        // Update in-memory active sockets
+        for (const [sId, activeRider] of onlineRiders.entries()) {
+            if (activeRider.employeeId === riderData.employeeId) {
+                activeRider.currentCan = scannedCanId;
+                activeRider.teaCups = 120;
+                activeRider.teasSold = 0;
+                activeRider.canIndex = nextCanIndex;
+                activeRider.canRequestStatus = 'none';
+                activeRider.canHistory = newHistory;
+                onlineRiders.set(sId, activeRider);
+                break;
+            }
+        }
+
+        // Broadcast to admin and riders
+        io.to('admin').emit('riders_update', { riders: getOnlineRidersArray(), count: onlineRiders.size });
+
+        res.json({ success: true, message: 'Can swapped successfully' });
+    } catch (err) {
+        console.error('Can Received Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to swap can' });
     }
 });
 
