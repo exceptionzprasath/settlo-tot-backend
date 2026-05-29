@@ -416,8 +416,13 @@ app.post('/api/orders', async (req, res) => {
 
         await ordersCol.doc(orderId).set(orderData);
 
+        let protocol = req.headers['x-forwarded-proto'] || req.protocol;
+        if (req.get('host').includes('railway.app') || req.get('host').includes('foodman.company') || req.get('host').includes('production')) {
+            protocol = 'https';
+        }
+
         // Serve Checkout hosted payment page URL on the approved company website domain
-        const checkoutUrl = `https://www.foodman.company/checkout?orderId=${orderId}&amount=${totalAmount}&razorpayOrderId=${razorpayOrder.id}&name=${encodeURIComponent(orderData.customerName || '')}&phone=${encodeURIComponent(orderData.customerPhone || '')}&backendUrl=${encodeURIComponent(`${req.protocol}://${req.get('host')}`)}&keyId=${encodeURIComponent(process.env.RAZORPAY_KEY_ID || 'rzp_test_SvBVS8NOrU9avJ')}`;
+        const checkoutUrl = `https://www.foodman.company/checkout?orderId=${orderId}&amount=${totalAmount}&razorpayOrderId=${razorpayOrder.id}&name=${encodeURIComponent(orderData.customerName || '')}&phone=${encodeURIComponent(orderData.customerPhone || '')}&backendUrl=${encodeURIComponent(`${protocol}://${req.get('host')}`)}&keyId=${encodeURIComponent(process.env.RAZORPAY_KEY_ID || 'rzp_test_SvBVS8NOrU9avJ')}`;
         
         res.json({ 
             success: true, 
