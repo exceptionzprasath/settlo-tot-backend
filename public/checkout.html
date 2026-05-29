@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Thambi Oru Tea - Secure Checkout</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;800&display=swap" rel="stylesheet">
+    <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+    <style>
+        :root {
+            --bg-color: #0A0F14;
+            --card-bg: #131B24;
+            --primary: #FFB300; /* Warm Tea Gold */
+            --primary-glow: rgba(255, 179, 0, 0.15);
+            --text-main: #FFFFFF;
+            --text-muted: #8E9AA6;
+            --border-color: #202D3A;
+            --success: #00E676;
+            --error: #FF1744;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+            overflow-x: hidden;
+        }
+
+        .checkout-container {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 24px;
+            width: 100%;
+            max-width: 480px;
+            padding: 30px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5), 0 0 50px var(--primary-glow);
+            text-align: center;
+            position: relative;
+            backdrop-filter: blur(10px);
+            animation: slideUp 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+
+        @keyframes slideUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .brand-header {
+            margin-bottom: 25px;
+        }
+
+        .logo {
+            width: 70px;
+            height: 70px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, var(--primary), #FF6F00);
+            margin: 0 auto 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 0 20px rgba(255, 179, 0, 0.4);
+        }
+
+        .logo svg {
+            width: 36px;
+            height: 36px;
+            fill: #000;
+        }
+
+        .brand-name {
+            font-size: 24px;
+            font-weight: 800;
+            letter-spacing: 0.5px;
+            background: linear-gradient(90deg, #FFFFFF, var(--primary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .order-summary {
+            background-color: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 20px;
+            margin-bottom: 25px;
+            text-align: left;
+        }
+
+        .order-summary h3 {
+            font-size: 16px;
+            color: var(--text-muted);
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            font-weight: 600;
+            letter-spacing: 1px;
+            border-bottom: 1px dashed var(--border-color);
+            padding-bottom: 8px;
+        }
+
+        .summary-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+            font-size: 15px;
+        }
+
+        .summary-row.total {
+            margin-top: 15px;
+            padding-top: 12px;
+            border-top: 1px solid var(--border-color);
+            font-weight: 700;
+            font-size: 18px;
+            color: var(--primary);
+        }
+
+        .item-list {
+            max-height: 100px;
+            overflow-y: auto;
+            margin-bottom: 5px;
+            padding-right: 5px;
+        }
+
+        .item-list::-webkit-scrollbar {
+            width: 4px;
+        }
+        .item-list::-webkit-scrollbar-thumb {
+            background-color: var(--border-color);
+            border-radius: 2px;
+        }
+
+        .item-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 14px;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+
+        .status-container {
+            margin: 25px 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid rgba(255, 179, 0, 0.1);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 1s infinite linear;
+            box-shadow: 0 0 15px rgba(255, 179, 0, 0.2);
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .status-text {
+            font-size: 16px;
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+
+        .pay-btn {
+            background: linear-gradient(135deg, var(--primary), #FF8F00);
+            color: #0A0F14;
+            border: none;
+            border-radius: 14px;
+            padding: 16px 24px;
+            font-size: 16px;
+            font-weight: 700;
+            cursor: pointer;
+            width: 100%;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(255, 179, 0, 0.3);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        .pay-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(255, 179, 0, 0.4);
+        }
+
+        .pay-btn:active {
+            transform: translateY(0);
+        }
+
+        .footer-note {
+            margin-top: 20px;
+            font-size: 12px;
+            color: var(--text-muted);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+        }
+
+        .footer-note svg {
+            width: 14px;
+            height: 14px;
+            fill: var(--text-muted);
+        }
+    </style>
+</head>
+<body>
+
+    <div class="checkout-container">
+        <!-- Header -->
+        <div class="brand-header">
+            <div class="logo">
+                <svg viewBox="0 0 24 24">
+                    <path d="M2,21H20V19H2M20,8H18V5H20M20,3H4V17H20A4,4 0 0,0 24,13V7A4,4 0 0,0 20,3Z" />
+                </svg>
+            </div>
+            <div class="brand-name">Thambi Oru Tea</div>
+        </div>
+
+        <!-- Order details -->
+        <div class="order-summary">
+            <h3>Order Details</h3>
+            <div class="item-list" id="items-container">
+                <!-- Dynamically populated -->
+            </div>
+            <div class="summary-row">
+                <span>Order ID</span>
+                <span id="order-id" style="font-family: monospace; font-weight: 600;">--</span>
+            </div>
+            <div class="summary-row total">
+                <span>Total Amount</span>
+                <span id="total-amount">₹0.00</span>
+            </div>
+        </div>
+
+        <!-- Status / Action -->
+        <div class="status-container" id="status-area">
+            <div class="spinner"></div>
+            <div class="status-text" id="status-label">Initiating Payment Gateway...</div>
+        </div>
+
+        <button class="pay-btn" id="pay-button" style="display: none;">
+            <span>Pay Now</span>
+            <svg style="width: 20px; height: 20px; fill: currentColor;" viewBox="0 0 24 24">
+                <path d="M12,22A10,10 0 0,1 2,12A10,10 0 0,1 12,2C17.5,2 22,6.5 22,12A10,10 0 0,1 12,22M12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20A8,8 0 0,0 20,12A8,8 0 0,0 12,4M12,6V11.5L16.2,14.2L15.4,15.4L10.5,12.2V6H12Z" />
+            </svg>
+        </button>
+
+        <!-- Secure Footer -->
+        <div class="footer-note">
+            <svg viewBox="0 0 24 24">
+                <path d="M12,12A2,2 0 1,0 14,10A2,2 0 0,0 12,12M18,8A6,6 0 0,0 6,8C6,12 12,22 12,22C12,22 18,12 18,8M12,2A6,6 0 0,1 18,8C18,11.57 14,16.47 12,20C10,16.47 6,11.57 6,8A6,6 0 0,1 12,2Z" />
+            </svg>
+            <span>Secured by Razorpay • 256-bit SSL</span>
+        </div>
+    </div>
+
+    <script>
+        // These placeholders are replaced dynamically by the Express server
+        const keyId = "{{KEY_ID}}";
+        const orderId = "{{ORDER_ID}}";
+        const razorpayOrderId = "{{RAZORPAY_ORDER_ID}}";
+        const rawAmount = parseFloat("{{AMOUNT}}");
+        const customerName = "{{CUSTOMER_NAME}}";
+        const customerPhone = "{{CUSTOMER_PHONE}}";
+        const items = JSON.parse('{{ITEMS}}');
+
+        // Populate HTML fields
+        document.getElementById('order-id').innerText = orderId;
+        document.getElementById('total-amount').innerText = "₹" + rawAmount.toFixed(2);
+
+        // Populate items list
+        const itemsContainer = document.getElementById('items-container');
+        if (items && items.length > 0) {
+            itemsContainer.innerHTML = items.map(item => `
+                <div class="item-row">
+                    <span>${item.name} × ${item.quantity}</span>
+                    <span>₹${(item.price * item.quantity).toFixed(2)}</span>
+                </div>
+            `).join('');
+        } else {
+            itemsContainer.innerHTML = '<div style="color: var(--text-muted); font-size: 13px;">Online Order items</div>';
+        }
+
+        // Initialize Razorpay Options
+        const options = {
+            "key": keyId,
+            "amount": Math.round(rawAmount * 100), // in paise
+            "currency": "INR",
+            "name": "Thambi Oru Tea",
+            "description": "Order #" + orderId,
+            "order_id": razorpayOrderId,
+            "prefill": {
+                "name": customerName,
+                "contact": customerPhone
+            },
+            "handler": function (response) {
+                // Update UI to verifying state
+                document.getElementById('status-area').style.display = 'flex';
+                document.getElementById('status-label').innerText = 'Verifying payment signature...';
+                document.getElementById('pay-button').style.display = 'none';
+
+                // Send to verification route
+                const verifyUrl = `/api/payments/verify` +
+                    `?orderId=${encodeURIComponent(orderId)}` +
+                    `&razorpay_payment_id=${encodeURIComponent(response.razorpay_payment_id)}` +
+                    `&razorpay_order_id=${encodeURIComponent(response.razorpay_order_id)}` +
+                    `&razorpay_signature=${encodeURIComponent(response.razorpay_signature)}`;
+
+                window.location.href = verifyUrl;
+            },
+            "modal": {
+                "ondismiss": function() {
+                    // Modal closed by user
+                    document.getElementById('status-area').style.display = 'none';
+                    document.getElementById('pay-button').style.display = 'flex';
+                    document.getElementById('pay-button').onclick = launchCheckout;
+                }
+            },
+            "theme": {
+                "color": "#FFB300"
+            }
+        };
+
+        const rzp = new Razorpay(options);
+
+        function launchCheckout() {
+            document.getElementById('status-area').style.display = 'flex';
+            document.getElementById('status-label').innerText = 'Opening secure payment gateway...';
+            document.getElementById('pay-button').style.display = 'none';
+            rzp.open();
+        }
+
+        // Auto-launch Razorpay Checkout after short delay
+        window.addEventListener('load', () => {
+            setTimeout(launchCheckout, 1000);
+        });
+    </script>
+</body>
+</html>

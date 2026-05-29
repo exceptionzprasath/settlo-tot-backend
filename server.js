@@ -5,6 +5,14 @@ const https = require('https');
 const { Server } = require('socket.io');
 require('dotenv').config();
 
+// Razorpay SDK Integration
+const Razorpay = require('razorpay');
+const razorpay = new Razorpay({
+    key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_SvBVS8NOrU9avJ',
+    key_secret: process.env.RAZORPAY_KEY_SECRET || '3kVnex8G4MsJj9bkLERrh2vR'
+});
+
+
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -340,7 +348,11 @@ const admin = require('firebase-admin');
 const db = initFirebase();
 const ordersCol = db.collection('tot_orders');
 
-// Create new order - saves to Firestore + dispatches to nearby riders
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+// Create new order - saves to Firestore as pending_payment + generates Razorpay Order
 app.post('/api/orders', async (req, res) => {
     try {
         const orderId = req.body.id || ('ORD' + Math.floor(100000 + Math.random() * 900000));
@@ -378,56 +390,242 @@ app.post('/api/orders', async (req, res) => {
             }
         }
 
+        // Create Razorpay Order first
+        const totalAmount = parseFloat(req.body.totalAmount) || 0;
+        const razorpayOptions = {
+            amount: Math.round(totalAmount * 100), // in paise
+            currency: "INR",
+            receipt: orderId
+        };
+
+        console.log(`💳 [Razorpay] Creating Razorpay Order for Order #${orderId} with amount ₹${totalAmount}...`);
+        const razorpayOrder = await razorpay.orders.create(razorpayOptions);
+        console.log(`💳 [Razorpay] Created Razorpay Order: ${razorpayOrder.id}`);
+
         const orderData = {
             ...req.body,
             id: orderId,
             customerLocation,
-            status: 'placed',
+            status: 'pending_payment',
+            paymentMode: 'online',
+            paymentStatus: 'pending',
+            razorpayOrderId: razorpayOrder.id,
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString()
         };
 
         await ordersCol.doc(orderId).set(orderData);
 
-        // 🚀 Dispatch to nearby riders within 3km radius
-        dispatchToNearbyRiders(orderData);
-
-        // ⏰ 30-second order acceptance timeout
-        setTimeout(async () => {
-            try {
-                const orderRef = ordersCol.doc(orderId);
-                const doc = await orderRef.get();
-                if (doc.exists) {
-                    const currentOrder = doc.data();
-                    if (currentOrder.status === 'placed') {
-                        // Mark as unassigned
-                        await orderRef.update({
-                            status: 'unassigned',
-                            updatedAt: new Date().toISOString()
-                        });
-                        console.log(`⏰ [Order Timeout] Order #${orderId} expired without rider acceptance.`);
-
-                        // Notify customer via socket room
-                        io.to(`customer_${currentOrder.customerPhone}`).emit('order_status_update', {
-                            orderId,
-                            status: 'unassigned'
-                        });
-
-                        // Broadcast to riders to remove order from their list
-                        io.to('riders').emit('order_expired', { orderId });
-                    }
-                }
-            } catch (timeoutErr) {
-                console.error(`Error in order ${orderId} timeout:`, timeoutErr);
-            }
-        }, 30000);
-
-        res.json({ success: true, message: 'Order placed successfully', order: orderData });
+        // Serve Checkout hosted payment page URL
+        const checkoutUrl = `${req.protocol}://${req.get('host')}/checkout/${orderId}`;
+        
+        res.json({ 
+            success: true, 
+            pendingPayment: true,
+            orderId: orderId, 
+            checkoutUrl: checkoutUrl,
+            order: orderData 
+        });
     } catch (err) {
         console.error('Create Order Error:', err);
-        res.status(500).json({ success: false, message: 'Failed to place order' });
+        res.status(500).json({ success: false, message: 'Failed to initiate payment & place order' });
     }
 });
+
+// Hosted checkout page route
+app.get('/checkout/:orderId', async (req, res) => {
+    try {
+        const orderId = req.params.orderId;
+        const doc = await ordersCol.doc(orderId).get();
+        if (!doc.exists) {
+            return res.status(404).send('<h1>Order not found</h1>');
+        }
+        
+        const order = doc.data();
+        if (order.status !== 'pending_payment') {
+            return res.send(`
+                <div style="font-family: sans-serif; text-align: center; margin-top: 50px; background-color: #0A0F14; color: white; height: 100vh; padding: 20px; box-sizing: border-box;">
+                    <h1>Order Already Processed</h1>
+                    <p>This order is already being processed (Status: ${order.status}).</p>
+                </div>
+            `);
+        }
+
+        let html = fs.readFileSync(path.join(__dirname, 'public', 'checkout.html'), 'utf8');
+        html = html.replace('{{KEY_ID}}', process.env.RAZORPAY_KEY_ID || 'rzp_test_SvBVS8NOrU9avJ')
+                   .replace('{{AMOUNT}}', order.totalAmount)
+                   .replace('{{ORDER_ID}}', order.id)
+                   .replace('{{RAZORPAY_ORDER_ID}}', order.razorpayOrderId || '')
+                   .replace('{{CUSTOMER_NAME}}', order.customerName || 'Customer')
+                   .replace('{{CUSTOMER_PHONE}}', order.customerPhone || '')
+                   .replace('{{ITEMS}}', JSON.stringify(order.items || []));
+                   
+        res.send(html);
+    } catch (err) {
+        console.error('Error serving checkout page:', err);
+        res.status(500).send('<h1>Internal Server Error</h1>');
+    }
+});
+
+// GET Signature verification and redirect to deep link
+app.get('/api/payments/verify', async (req, res) => {
+    const { orderId, razorpay_payment_id, razorpay_order_id, razorpay_signature } = req.query;
+    
+    try {
+        const orderRef = ordersCol.doc(orderId);
+        const doc = await orderRef.get();
+        
+        if (!doc.exists) {
+            return res.status(404).send('<h1>Order not found</h1>');
+        }
+        
+        const order = doc.data();
+        
+        // Generate signature verification
+        const text = razorpay_order_id + "|" + razorpay_payment_id;
+        const generated_signature = crypto
+            .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET || "3kVnex8G4MsJj9bkLERrh2vR")
+            .update(text)
+            .digest("hex");
+
+        if (generated_signature === razorpay_signature) {
+            console.log(`✅ [Payment Verified] Order #${orderId} payment succeeded!`);
+            
+            const updatedOrderData = {
+                ...order,
+                status: 'placed',
+                paymentStatus: 'paid',
+                paymentMode: 'online',
+                razorpayPaymentId: razorpay_payment_id,
+                razorpaySignature: razorpay_signature,
+                updatedAt: new Date().toISOString()
+            };
+            
+            // 1. Update order in Firestore
+            await orderRef.set(updatedOrderData);
+            
+            // 2. Broadcast payment success to customer room
+            io.to(`customer_${order.customerPhone}`).emit('payment_success', {
+                orderId,
+                status: 'placed',
+                order: updatedOrderData
+            });
+            
+            // 3. Dispatch to nearby riders
+            dispatchToNearbyRiders(updatedOrderData);
+            
+            // 4. Set order timeout (30s) just like we did originally
+            setTimeout(async () => {
+                try {
+                    const checkDoc = await orderRef.get();
+                    if (checkDoc.exists) {
+                        const currentOrder = checkDoc.data();
+                        if (currentOrder.status === 'placed') {
+                            await orderRef.update({
+                                status: 'unassigned',
+                                updatedAt: new Date().toISOString()
+                            });
+                            console.log(`⏰ [Order Timeout] Paid Order #${orderId} expired without rider acceptance.`);
+                            io.to(`customer_${currentOrder.customerPhone}`).emit('order_status_update', {
+                                orderId,
+                                status: 'unassigned'
+                            });
+                            io.to('riders').emit('order_expired', { orderId });
+                        }
+                    }
+                } catch (timeoutErr) {
+                    console.error(`Error in paid order ${orderId} timeout:`, timeoutErr);
+                }
+            }, 30000);
+
+            // Serve a beautiful payment successful page that deep-links back to the app
+            res.send(`
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Payment Successful</title>
+                    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;700&display=swap" rel="stylesheet">
+                    <style>
+                        body {
+                            background-color: #0A0F14;
+                            color: white;
+                            font-family: 'Outfit', sans-serif;
+                            display: flex;
+                            flex-direction: column;
+                            align-items: center;
+                            justify-content: center;
+                            height: 100vh;
+                            margin: 0;
+                            text-align: center;
+                            padding: 20px;
+                            box-sizing: border-box;
+                        }
+                        .success-icon {
+                            width: 80px;
+                            height: 80px;
+                            background-color: #00E676;
+                            border-radius: 50%;
+                            display: flex;
+                            align-items: center;
+                            justify-content: center;
+                            margin-bottom: 20px;
+                            box-shadow: 0 0 30px rgba(0, 230, 118, 0.4);
+                            animation: scaleIn 0.5s ease-out;
+                        }
+                        @keyframes scaleIn {
+                            from { transform: scale(0); }
+                            to { transform: scale(1); }
+                        }
+                        h1 { color: #00E676; font-size: 28px; margin-bottom: 10px; }
+                        p { color: #8E9AA6; font-size: 16px; max-width: 320px; line-height: 1.5; margin-bottom: 35px; }
+                        .btn {
+                            background: linear-gradient(135deg, #FFB300, #FF8F00);
+                            color: #0A0F14;
+                            border: none;
+                            padding: 16px 32px;
+                            font-weight: 700;
+                            border-radius: 12px;
+                            text-decoration: none;
+                            font-size: 16px;
+                            box-shadow: 0 4px 15px rgba(255, 179, 0, 0.3);
+                            cursor: pointer;
+                            transition: all 0.3s ease;
+                        }
+                        .btn:hover {
+                            transform: translateY(-2px);
+                            box-shadow: 0 6px 20px rgba(255, 179, 0, 0.4);
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div class="success-icon">
+                        <svg width="40" height="40" viewBox="0 0 24 24" fill="black">
+                            <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+                        </svg>
+                    </div>
+                    <h1>Payment Successful!</h1>
+                    <p>Your payment has been verified. You can now close this tab and return to the app.</p>
+                    <a href="thambiorutea://payment-success?orderId=${orderId}" class="btn">Return to App</a>
+                    <script>
+                        // Auto redirect to deep link
+                        setTimeout(() => {
+                            window.location.href = "thambiorutea://payment-success?orderId=${orderId}";
+                        }, 1800);
+                    </script>
+                </body>
+                </html>
+            `);
+        } else {
+            console.error(`❌ [Payment Verification Failed] Signature mismatch for Order #${orderId}`);
+            res.status(400).send('<h1>Payment Verification Failed</h1>');
+        }
+    } catch (err) {
+        console.error('Error verifying payment:', err);
+        res.status(500).send('<h1>Internal Server Error</h1>');
+    }
+});
+
 
 // Get all placed orders (Firestore listener handles realtime; this is for one-time fetch)
 app.get('/api/orders/nearby', async (req, res) => {
