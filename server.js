@@ -416,8 +416,8 @@ app.post('/api/orders', async (req, res) => {
 
         await ordersCol.doc(orderId).set(orderData);
 
-        // Serve Checkout hosted payment page URL
-        const checkoutUrl = `${req.protocol}://${req.get('host')}/checkout/${orderId}`;
+        // Serve Checkout hosted payment page URL on the approved company website domain
+        const checkoutUrl = `https://www.foodman.company/checkout?orderId=${orderId}&amount=${totalAmount}&razorpayOrderId=${razorpayOrder.id}&name=${encodeURIComponent(orderData.customerName || '')}&phone=${encodeURIComponent(orderData.customerPhone || '')}&backendUrl=${encodeURIComponent(`${req.protocol}://${req.get('host')}`)}`;
         
         res.json({ 
             success: true, 
@@ -538,6 +538,11 @@ app.get('/api/payments/verify', async (req, res) => {
                 }
             }, 30000);
 
+            // If JSON response is requested by the brand website, return verified order details
+            if (req.query.format === 'json') {
+                return res.json({ success: true, message: 'Payment verified successfully', order: updatedOrderData });
+            }
+
             // Serve a beautiful payment successful page that deep-links back to the app
             res.send(`
                 <!DOCTYPE html>
@@ -618,10 +623,16 @@ app.get('/api/payments/verify', async (req, res) => {
             `);
         } else {
             console.error(`❌ [Payment Verification Failed] Signature mismatch for Order #${orderId}`);
+            if (req.query.format === 'json') {
+                return res.status(400).json({ success: false, message: 'Payment verification failed: Signature mismatch.' });
+            }
             res.status(400).send('<h1>Payment Verification Failed</h1>');
         }
     } catch (err) {
         console.error('Error verifying payment:', err);
+        if (req.query.format === 'json') {
+            return res.status(500).json({ success: false, message: 'Server verification error' });
+        }
         res.status(500).send('<h1>Internal Server Error</h1>');
     }
 });
