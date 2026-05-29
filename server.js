@@ -417,7 +417,7 @@ app.post('/api/orders', async (req, res) => {
         await ordersCol.doc(orderId).set(orderData);
 
         // Serve Checkout hosted payment page URL on the approved company website domain
-        const checkoutUrl = `https://www.foodman.company/checkout?orderId=${orderId}&amount=${totalAmount}&razorpayOrderId=${razorpayOrder.id}&name=${encodeURIComponent(orderData.customerName || '')}&phone=${encodeURIComponent(orderData.customerPhone || '')}&backendUrl=${encodeURIComponent(`${req.protocol}://${req.get('host')}`)}`;
+        const checkoutUrl = `https://www.foodman.company/checkout?orderId=${orderId}&amount=${totalAmount}&razorpayOrderId=${razorpayOrder.id}&name=${encodeURIComponent(orderData.customerName || '')}&phone=${encodeURIComponent(orderData.customerPhone || '')}&backendUrl=${encodeURIComponent(`${req.protocol}://${req.get('host')}`)}&keyId=${encodeURIComponent(process.env.RAZORPAY_KEY_ID || 'rzp_test_SvBVS8NOrU9avJ')}`;
         
         res.json({ 
             success: true, 
