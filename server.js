@@ -19,9 +19,9 @@ const PORT = process.env.PORT || 3001;
 function geocodeAddress(address) {
     return new Promise((resolve) => {
         if (!address) return resolve(null);
-        
+
         const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(address)}&limit=1`;
-        
+
         const options = {
             headers: {
                 'User-Agent': 'ThambiOruTeaBackend/1.0'
@@ -303,11 +303,23 @@ io.on('connection', (socket) => {
     });
 
     // --- Disconnect cleanup ---
-    socket.on('disconnect', () => {
+    socket.on('disconnect', async () => {
         const rider = onlineRiders.get(socket.id);
         if (rider) {
             console.log(`⚡ Rider disconnected: ${rider.employeeName} (${rider.employeeId}) | Total online: ${onlineRiders.size - 1}`);
             onlineRiders.delete(socket.id);
+
+            // Sync offline status to Firestore
+            try {
+                await db.collection('online_riders').doc(rider.employeeId).update({
+                    isOnline: false,
+                    lastUpdated: new Date().toISOString()
+                });
+                console.log(`🔥 [Firestore] Synced OFFLINE (disconnect) for Rider ${rider.employeeId}`);
+            } catch (firestoreErr) {
+                console.error(`❌ [Firestore] Error syncing disconnect:`, firestoreErr.message);
+            }
+
             io.to('admin').emit('riders_update', { riders: getOnlineRidersArray(), count: onlineRiders.size });
         }
         console.log('🔌 Socket disconnected:', socket.id);
@@ -332,7 +344,7 @@ const ordersCol = db.collection('tot_orders');
 app.post('/api/orders', async (req, res) => {
     try {
         const orderId = req.body.id || ('ORD' + Math.floor(100000 + Math.random() * 900000));
-        
+
         // Handle coordinate mapping if client sends locationCoords/deliveryAddress instead of customerLocation
         let customerLocation = req.body.customerLocation || null;
         if (!customerLocation && req.body.locationCoords) {
@@ -394,13 +406,13 @@ app.post('/api/orders', async (req, res) => {
                             updatedAt: new Date().toISOString()
                         });
                         console.log(`⏰ [Order Timeout] Order #${orderId} expired without rider acceptance.`);
-                        
+
                         // Notify customer via socket room
                         io.to(`customer_${currentOrder.customerPhone}`).emit('order_status_update', {
                             orderId,
                             status: 'unassigned'
                         });
-                        
+
                         // Broadcast to riders to remove order from their list
                         io.to('riders').emit('order_expired', { orderId });
                     }
@@ -597,6 +609,67 @@ app.patch('/api/orders/:id/status', async (req, res) => {
     }
 });
 
+// Record offline sale for an employee (updates Firestore inventory in real-time)
+app.post('/api/employees/:employeeId/offline-sale', async (req, res) => {
+    try {
+        const { employeeId } = req.params;
+        const { cupsSold, paymentMode } = req.body;
+
+        if (!cupsSold || cupsSold <= 0) {
+            return res.status(400).json({ success: false, message: 'Cups sold must be greater than 0' });
+        }
+
+        const riderRef = db.collection('online_riders').doc(employeeId);
+        const riderDoc = await riderRef.get();
+
+        if (riderDoc.exists) {
+            const rData = riderDoc.data();
+            const currentCups = rData.teaCups !== undefined ? rData.teaCups : 120;
+            const newTeaCups = Math.max(0, currentCups - cupsSold);
+            const newTeasSold = (rData.teasSold || 0) + cupsSold;
+            const newTotalTeasSold = (rData.totalTeasSold || 0) + cupsSold;
+
+            await riderRef.update({
+                teaCups: newTeaCups,
+                teasSold: newTeasSold,
+                totalTeasSold: newTotalTeasSold,
+                lastUpdated: new Date().toISOString()
+            });
+
+            // Update in-memory map so Socket.io admin broadcasts get the new inventory count instantly
+            for (const [sId, activeRider] of onlineRiders.entries()) {
+                if (activeRider.employeeId === employeeId) {
+                    activeRider.teaCups = newTeaCups;
+                    activeRider.teasSold = newTeasSold;
+                    activeRider.totalTeasSold = newTotalTeasSold;
+                    onlineRiders.set(sId, activeRider);
+                    break;
+                }
+            }
+
+            console.log(`🔥 [Inventory Offline Sale] Decremented rider ${employeeId} by ${cupsSold} cups. Now: ${newTeaCups}/120 left. Payment: ${paymentMode}`);
+
+            // Broadcast update to Admin Live view
+            io.to('admin').emit('riders_update', { riders: getOnlineRidersArray(), count: onlineRiders.size });
+
+            return res.json({ 
+                success: true, 
+                message: 'Offline sale recorded successfully', 
+                data: {
+                    teaCups: newTeaCups,
+                    teasSold: newTeasSold,
+                    totalTeasSold: newTotalTeasSold
+                }
+            });
+        } else {
+            return res.status(404).json({ success: false, message: 'Rider is not online' });
+        }
+    } catch (err) {
+        console.error('Offline Sale Error:', err);
+        return res.status(500).json({ success: false, message: 'Failed to record offline sale' });
+    }
+});
+
 // Get orders for a specific customer
 app.get('/api/orders/customer/:phone', async (req, res) => {
     try {
@@ -764,17 +837,17 @@ app.post('/api/auth/login', async (req, res) => {
 
         if (result.Items && result.Items.length > 0) {
             const employee = result.Items[0];
-            
+
             if (employee.status === 'pending_verification') {
-                return res.json({ 
-                    success: false, 
-                    message: 'Your account is pending verification. Please wait for admin approval.' 
+                return res.json({
+                    success: false,
+                    message: 'Your account is pending verification. Please wait for admin approval.'
                 });
             }
 
-            res.json({ 
-                success: true, 
-                message: 'Login successful', 
+            res.json({
+                success: true,
+                message: 'Login successful',
                 token: `token_${Date.now()}`,
                 employee
             });
@@ -810,10 +883,10 @@ app.patch('/api/auth/profile', async (req, res) => {
 
         const result = await ddbDocClient.send(new UpdateCommand(updateParams));
 
-        res.json({ 
-            success: true, 
-            message: 'Profile updated successfully', 
-            user: result.Attributes 
+        res.json({
+            success: true,
+            message: 'Profile updated successfully',
+            user: result.Attributes
         });
     } catch (err) {
         console.error('Update Profile Error:', err);
@@ -830,7 +903,7 @@ app.get('/api/auth/me/:empId', async (req, res) => {
             FilterExpression: 'empId = :empId',
             ExpressionAttributeValues: { ':empId': empId }
         }));
-        
+
         if (result.Items && result.Items.length > 0) {
             res.json({ success: true, employee: result.Items[0] });
         } else {
@@ -953,10 +1026,10 @@ app.post('/api/admin/applications/:phone/status', async (req, res) => {
 
         const result = await ddbDocClient.send(new UpdateCommand(updateParams));
 
-        res.json({ 
-            success: true, 
-            message: `Employee status updated to ${status}`, 
-            user: result.Attributes 
+        res.json({
+            success: true,
+            message: `Employee status updated to ${status}`,
+            user: result.Attributes
         });
     } catch (err) {
         console.error('Update Application Status Error:', err);
@@ -1162,12 +1235,12 @@ app.post('/api/admin/employees/:phone/can-received', async (req, res) => {
 app.delete('/api/admin/employees/:phone', async (req, res) => {
     try {
         const { phone } = req.params;
-        
+
         await ddbDocClient.send(new DeleteCommand({
             TableName: tableName,
             Key: { phone }
         }));
-        
+
         res.json({ success: true, message: 'Employee deleted successfully' });
     } catch (err) {
         console.error('Delete Employee Error:', err);
@@ -1325,6 +1398,15 @@ app.get('/api/config/maps', (req, res) => {
     res.json({
         apiKey: process.env.GOOGLE_MAPS_API_KEY,
         message: 'Use this key for Google Maps integration'
+    });
+});
+
+// App Version Config for Force Updates
+app.get('/api/config/app-version', (req, res) => {
+    res.json({
+        minRequiredVersion: process.env.MIN_REQUIRED_VERSION || '0.0.1',
+        latestVersion: process.env.LATEST_VERSION || '0.0.2',
+        playStoreUrl: process.env.PLAY_STORE_URL || 'https://play.google.com/store/apps/details?id=com.thambiorutea2'
     });
 });
 
