@@ -390,10 +390,11 @@ app.post('/api/orders', async (req, res) => {
             }
         }
 
-        // Check if user is eligible for First Tea Free promo
+        // Check if user is eligible for First Tea Free promo (if they haven't received it in any successfully placed order yet)
         const ordersSnapshot = await ordersCol.where('customerPhone', '==', req.body.customerPhone).get();
         const validOrders = ordersSnapshot.docs.filter(doc => doc.data().status !== 'pending_payment');
-        const isEligibleForFreeTea = validOrders.length === 0;
+        const hasReceivedFreeTea = validOrders.some(doc => doc.data().firstTeaFree === true);
+        const isEligibleForFreeTea = !hasReceivedFreeTea;
 
         let items = req.body.items || [];
         let firstTeaFree = false;
@@ -996,7 +997,8 @@ app.get('/api/orders/customer/:phone/free-tea-eligibility', async (req, res) => 
             return data.status !== 'pending_payment';
         });
         
-        const isEligible = validOrders.length === 0;
+        const hasReceivedFreeTea = validOrders.some(doc => doc.data().firstTeaFree === true);
+        const isEligible = !hasReceivedFreeTea;
         res.json({ success: true, eligible: isEligible });
     } catch (err) {
         console.error('Free Tea Eligibility Error:', err);
