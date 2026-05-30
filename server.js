@@ -1826,3 +1826,103 @@ runSetup().then(() => {
 }).catch(err => {
     console.error("Failed to setup AWS resources:", err);
 });
+
+// ============================================
+// AUTOMATED DAILY PUSH NOTIFICATION SCHEDULER
+// Fires push alerts to 'all_users' (covering both thambiorutea2 and totemployee) in Indian Standard Time (IST)
+// ============================================
+
+let lastFiredTime = ''; // Format: "YYYY-MM-DD HH:mm"
+
+async function sendScheduledPushNotification(title, body) {
+    try {
+        console.log(`⏰ [Scheduled Notification] Preparing automated push alert: "${title}"`);
+        const message = {
+            notification: {
+                title: title,
+                body: body
+            },
+            topic: 'all_users',
+            android: {
+                priority: 'high',
+                notification: {
+                    sound: 'default',
+                    channelId: 'default_notification_channel',
+                    priority: 'max',
+                    defaultSound: true,
+                    defaultVibrateTimings: true,
+                }
+            },
+            data: {
+                type: 'broadcast',
+                click_action: 'FLUTTER_NOTIFICATION_CLICK',
+                title: title,
+                body: body
+            }
+        };
+
+        const response = await admin.messaging().send(message);
+        console.log(`✅ [Scheduled Notification] Sent successfully to topic "all_users":`, response);
+    } catch (err) {
+        console.error('❌ [Scheduled Notification] Failed to send broadcast:', err);
+    }
+}
+
+function checkAndSendScheduledNotifications() {
+    try {
+        const now = new Date();
+        const formatter = new Intl.DateTimeFormat('en-US', {
+            timeZone: 'Asia/Kolkata',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false
+        });
+        
+        // Formatter returns string like "05/30/2026, 22:32"
+        const formatted = formatter.format(now);
+        const [datePart, timePart] = formatted.split(', ');
+        const [month, day, year] = datePart.split('/');
+        const [hour, minute] = timePart.split(':');
+        
+        const timeKey = `${hour}:${minute}`; // "HH:mm"
+        const fireKey = `${year}-${month}-${day} ${timeKey}`; // "YYYY-MM-DD HH:mm"
+
+        const schedules = {
+            "07:00": {
+                title: "காலை வணக்கம்! டீ ரெடி ☕",
+                body: "உங்கள் நாளை ஒரு சூடான டீயுடன் தொடங்குங்கள். இப்போதே ஆர்டர் செய்து புத்துணர்ச்சி பெறுங்கள்."
+            },
+            "11:00": {
+                title: "Tea Break Time! ☕✨",
+                body: "வேலை அழுத்தத்தை மறந்து ஒரு சூடான டீயுடன் புத்துணர்ச்சி பெறுங்கள். இப்போதே ஆர்டர் செய்யுங்கள்."
+            },
+            "13:00": {
+                title: "Lunch + Tea = Perfect Combo ☕🍽️",
+                body: "மதிய உணவுக்குப் பிறகு ஒரு சூடான டீ உங்கள் மனதையும் உடலையும் ரிலாக்ஸ் செய்யும்."
+            },
+            "16:00": {
+                title: "It's Tea O'Clock! ☕⏰",
+                body: "மாலை நேர சோர்வை ஒரு கப் சூடான டீயால் விரட்டுங்கள். இப்போதே ஆர்டர் செய்யுங்கள்."
+            },
+            "18:00": {
+                title: "Work Done? Tea Time! ☕🎉",
+                body: "நாள் முழுவதும் உழைத்த பிறகு ஒரு சூடான டீயுடன் மாலையை மகிழ்ச்சியாக கழியுங்கள்."
+            }
+        };
+
+        if (schedules[timeKey] && lastFiredTime !== fireKey) {
+            lastFiredTime = fireKey;
+            const promo = schedules[timeKey];
+            sendScheduledPushNotification(promo.title, promo.body);
+        }
+    } catch (err) {
+        console.error('❌ [Scheduled Notification] Error in check logic:', err);
+    }
+}
+
+// Start checking every 10 seconds to ensure high accuracy without missing or double firing
+setInterval(checkAndSendScheduledNotifications, 10000);
+
