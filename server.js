@@ -390,25 +390,106 @@ app.post('/api/orders', async (req, res) => {
             }
         }
 
-        // Create Razorpay Order first
-        const totalAmount = parseFloat(req.body.totalAmount) || 0;
+        // Check if user is eligible for First Tea Free promo
+        const ordersSnapshot = await ordersCol.where('customerPhone', '==', req.body.customerPhone).get();
+        const validOrders = ordersSnapshot.docs.filter(doc => doc.data().status !== 'pending_payment');
+        const isEligibleForFreeTea = validOrders.length === 0;
+
+        let items = req.body.items || [];
+        let firstTeaFree = false;
+        let finalTotalAmount = parseFloat(req.body.totalAmount) || 0;
+
+        if (isEligibleForFreeTea) {
+            // Find Premium Tea (item_001) in items list
+            const teaItemIndex = items.findIndex(item => item.id === 'item_001');
+            if (teaItemIndex > -1) {
+                firstTeaFree = true;
+                // Re-calculate the grand total with free tea applied to ensure data integrity
+                let calcTotal = items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+                calcTotal = Math.max(0, calcTotal - 15);
+                finalTotalAmount = calcTotal;
+            }
+        }
+
+        const isFreeOrder = finalTotalAmount === 0;
+        const paymentMethod = req.body.paymentMethod || 'ONLINE'; // 'ONLINE' or 'COD'
+
+        // Direct order placement (no Razorpay payment) for Cash on Delivery (COD) OR Promotional FREE orders (₹0 total)
+        if (paymentMethod === 'COD' || isFreeOrder) {
+            const orderData = {
+                ...req.body,
+                id: orderId,
+                items,
+                totalAmount: finalTotalAmount,
+                customerLocation,
+                status: 'placed',
+                paymentMode: isFreeOrder ? 'free' : 'COD',
+                paymentStatus: isFreeOrder ? 'paid' : 'pending',
+                firstTeaFree,
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString()
+            };
+
+            console.log(`💵 [Order] Placing directly (COD/Free) Order #${orderId} | Total: ₹${finalTotalAmount} | Mode: ${orderData.paymentMode}...`);
+            await ordersCol.doc(orderId).set(orderData);
+
+            // Dispatch immediately to nearby riders via Firestore geofencing + socket
+            dispatchToNearbyRiders(orderData);
+
+            // Start unassigned timeout of 30 seconds
+            setTimeout(async () => {
+                try {
+                    const orderRef = ordersCol.doc(orderId);
+                    const checkDoc = await orderRef.get();
+                    if (checkDoc.exists) {
+                        const currentOrder = checkDoc.data();
+                        if (currentOrder.status === 'placed') {
+                            await orderRef.update({
+                                status: 'unassigned',
+                                updatedAt: new Date().toISOString()
+                            });
+                            console.log(`⏰ [Order Timeout] Direct Order #${orderId} expired without rider acceptance.`);
+                            io.to(`customer_${currentOrder.customerPhone}`).emit('order_status_update', {
+                                orderId,
+                                status: 'unassigned'
+                            });
+                            io.to('riders').emit('order_expired', { orderId });
+                        }
+                    }
+                } catch (timeoutErr) {
+                    console.error(`Error in COD order ${orderId} timeout:`, timeoutErr);
+                }
+            }, 30000);
+
+            return res.json({
+                success: true,
+                pendingPayment: false,
+                orderId: orderId,
+                order: orderData
+            });
+        }
+
+        // Create Razorpay Order first (Only for paid online orders)
         const razorpayOptions = {
-            amount: Math.round(totalAmount * 100), // in paise
+            amount: Math.round(finalTotalAmount * 100), // in paise
             currency: "INR",
             receipt: orderId
         };
 
-        console.log(`💳 [Razorpay] Creating Razorpay Order for Order #${orderId} with amount ₹${totalAmount}...`);
+        console.log(`💳 [Razorpay] Creating Razorpay Order for Order #${orderId} with amount ₹${finalTotalAmount}...`);
         const razorpayOrder = await razorpay.orders.create(razorpayOptions);
         console.log(`💳 [Razorpay] Created Razorpay Order: ${razorpayOrder.id}`);
 
         const orderData = {
             ...req.body,
             id: orderId,
+            items,
+            totalAmount: finalTotalAmount,
             customerLocation,
             status: 'pending_payment',
             paymentMode: 'online',
             paymentStatus: 'pending',
+            firstTeaFree,
             razorpayOrderId: razorpayOrder.id,
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString()
@@ -422,7 +503,7 @@ app.post('/api/orders', async (req, res) => {
         }
 
         // Serve Checkout hosted payment page URL on the approved company website domain
-        const checkoutUrl = `https://www.foodman.company/checkout?orderId=${orderId}&amount=${totalAmount}&razorpayOrderId=${razorpayOrder.id}&name=${encodeURIComponent(orderData.customerName || '')}&phone=${encodeURIComponent(orderData.customerPhone || '')}&backendUrl=${encodeURIComponent(`${protocol}://${req.get('host')}`)}&keyId=${encodeURIComponent(process.env.RAZORPAY_KEY_ID || 'rzp_test_SvBVS8NOrU9avJ')}`;
+        const checkoutUrl = `https://www.foodman.company/checkout?orderId=${orderId}&amount=${finalTotalAmount}&razorpayOrderId=${razorpayOrder.id}&name=${encodeURIComponent(orderData.customerName || '')}&phone=${encodeURIComponent(orderData.customerPhone || '')}&backendUrl=${encodeURIComponent(`${protocol}://${req.get('host')}`)}&keyId=${encodeURIComponent(process.env.RAZORPAY_KEY_ID || 'rzp_test_SvBVS8NOrU9avJ')}`;
         
         res.json({ 
             success: true, 
@@ -903,6 +984,26 @@ app.get('/api/orders/customer/:phone', async (req, res) => {
         }
     }
 });
+// Check if a customer is eligible for "First Tea Free"
+app.get('/api/orders/customer/:phone/free-tea-eligibility', async (req, res) => {
+    try {
+        const { phone } = req.params;
+        const snapshot = await ordersCol.where('customerPhone', '==', phone).get();
+        
+        // Check if there are any successfully placed/processed orders
+        const validOrders = snapshot.docs.filter(doc => {
+            const data = doc.data();
+            return data.status !== 'pending_payment';
+        });
+        
+        const isEligible = validOrders.length === 0;
+        res.json({ success: true, eligible: isEligible });
+    } catch (err) {
+        console.error('Free Tea Eligibility Error:', err);
+        res.status(500).json({ success: false, message: 'Server error checking eligibility' });
+    }
+});
+
 const { GetCommand, PutCommand, ScanCommand, UpdateCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
 const upload = require('./middleware/upload');
 
