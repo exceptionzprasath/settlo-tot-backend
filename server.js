@@ -1274,6 +1274,39 @@ app.patch('/api/auth/bank-details', async (req, res) => {
     }
 });
 
+// Update employee work history
+app.patch('/api/auth/work-history', async (req, res) => {
+    try {
+        const { phone, workHistory } = req.body;
+
+        if (!phone || !workHistory) {
+            return res.status(400).json({ success: false, message: 'Phone and Work History are required' });
+        }
+
+        const updateParams = {
+            TableName: tableName,
+            Key: { phone },
+            UpdateExpression: 'set workHistory = :workHistory, updatedAt = :time',
+            ExpressionAttributeValues: {
+                ':workHistory': workHistory,
+                ':time': new Date().toISOString()
+            },
+            ReturnValues: 'ALL_NEW'
+        };
+
+        const result = await ddbDocClient.send(new UpdateCommand(updateParams));
+
+        res.json({
+            success: true,
+            message: 'Work history updated successfully',
+            user: result.Attributes
+        });
+    } catch (err) {
+        console.error('Update Work History Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to update work history' });
+    }
+});
+
 // Get current user session
 app.get('/api/auth/me/:empId', async (req, res) => {
     try {
@@ -1296,18 +1329,140 @@ app.get('/api/auth/me/:empId', async (req, res) => {
 });
 
 // Get employee stats (mock implementation)
+// Get employee stats (Production Live Implementation)
 app.get('/api/employee/stats/:empId', async (req, res) => {
     try {
-        // Return mock stats for now
+        const { empId } = req.params;
+
+        // 1. Fetch employee from DynamoDB
+        const result = await ddbDocClient.send(new ScanCommand({
+            TableName: tableName,
+            FilterExpression: 'empId = :empId',
+            ExpressionAttributeValues: { ':empId': empId }
+        }));
+
+        if (!result.Items || result.Items.length === 0) {
+            return res.status(404).json({ success: false, message: 'Employee not found' });
+        }
+
+        const employee = result.Items[0];
+        const workHistory = employee.workHistory || {};
+
+        // 2. Gather active rider session if online
+        let activeSales = 0;
+        let activeRider = null;
+        for (const [_, rider] of onlineRiders.entries()) {
+            if (rider.employeeId === empId) {
+                activeRider = rider;
+                activeSales = rider.totalTeasSold || 0;
+                break;
+            }
+        }
+
+        // 3. Compute week/month date boundaries
+        const now = new Date();
+        
+        // Sunday of this week
+        const startOfWeek = new Date();
+        startOfWeek.setDate(now.getDate() - now.getDay());
+        startOfWeek.setHours(0, 0, 0, 0);
+
+        // 1st of this month
+        const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+
+        let todayOrders = activeRider ? 1 : 0; // count active shift as today's order/attendance
+        let todayEarnings = 0;
+        let todayTeas = activeSales;
+
+        let weeklyOrders = todayOrders;
+        let weeklyEarnings = 0;
+        let weeklyTeas = todayTeas;
+
+        let monthlyOrders = todayOrders;
+        let monthlyEarnings = 0;
+        let monthlyTeas = todayTeas;
+
+        // 4. Aggregate past records from DynamoDB workHistory
+        Object.keys(workHistory).forEach(dateStr => {
+            const log = workHistory[dateStr];
+            const dateObj = new Date(dateStr);
+            const sales = parseInt(log.sales || 0, 10);
+            
+            // Check today
+            const todayStr = now.toISOString().split('T')[0];
+            if (dateStr === todayStr) {
+                todayOrders = 1;
+                todayTeas = sales;
+            }
+
+            // Check week
+            if (dateObj >= startOfWeek) {
+                if (dateStr !== todayStr) {
+                    weeklyOrders++;
+                    weeklyTeas += sales;
+                }
+            }
+
+            // Check month
+            if (dateObj >= startOfMonth) {
+                if (dateStr !== todayStr) {
+                    monthlyOrders++;
+                    monthlyTeas += sales;
+                }
+            }
+        });
+
+        // 5. Calculate earnings based on employee type
+        const isPartTime = employee.employeeType === 'Part Time';
+        const rate = 2.50;
+
+        if (isPartTime) {
+            todayEarnings = todayTeas * rate;
+            weeklyEarnings = weeklyTeas * rate;
+            monthlyEarnings = monthlyTeas * rate;
+        } else {
+            // Full-time: Check if achieved early shift ₹250 incentive target on those days
+            todayEarnings = (todayTeas >= 360) ? 250 : 0;
+            
+            // For weekly/monthly, check dynamic achieved dates
+            weeklyEarnings = 0;
+            monthlyEarnings = 0;
+            
+            Object.keys(workHistory).forEach(dateStr => {
+                const log = workHistory[dateStr];
+                const dateObj = new Date(dateStr);
+                const sales = parseInt(log.sales || 0, 10);
+                const hitTarget = sales >= 360;
+
+                if (dateObj >= startOfWeek) {
+                    if (hitTarget) weeklyEarnings += 250;
+                }
+                if (dateObj >= startOfMonth) {
+                    if (hitTarget) monthlyEarnings += 250;
+                }
+            });
+            
+            // Include active today's shift incentive
+            if (todayTeas >= 360) {
+                weeklyEarnings += 250;
+                monthlyEarnings += 250;
+            }
+        }
+
         res.json({
             success: true,
             stats: {
-                todayOrders: 0,
-                todayEarnings: 0,
+                todayOrders,
+                todayEarnings,
+                weeklyOrders,
+                weeklyEarnings,
+                monthlyOrders,
+                monthlyEarnings,
                 rating: 4.8
             }
         });
     } catch (err) {
+        console.error('Fetch Stats Error:', err);
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
