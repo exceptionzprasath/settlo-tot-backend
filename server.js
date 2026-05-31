@@ -1113,7 +1113,7 @@ app.post('/api/auth/register', upload.fields([
     { name: 'familyAadhar', maxCount: 1 }
 ]), async (req, res) => {
     try {
-        const { name, phone, mobile, instagram, facebook, email, role, empId, address, familyRelation, pin, alternateNumber, gender, vehicleType, vehicleNumber, dateOfJoining } = req.body;
+        const { name, phone, mobile, instagram, facebook, email, role, empId, address, familyRelation, pin, alternateNumber, gender, vehicleType, vehicleNumber, dateOfJoining, employeeType } = req.body;
         const files = req.files;
 
         // Use mobile if phone is not provided (employee app uses 'mobile')
@@ -1139,6 +1139,7 @@ app.post('/api/auth/register', upload.fields([
             vehicleType: vehicleType || null,
             vehicleNumber: vehicleNumber || null,
             dateOfJoining: dateOfJoining || null,
+            employeeType: employeeType || 'Full Time',
             // Documents mapping (flexible)
             selfieUrl: (files && (files.selfie || files.profilePhoto)) ? (files.selfie || files.profilePhoto)[0].location : null,
             insuranceUrl: (files && files.insurance) ? files.insurance[0].location : null,
@@ -1237,6 +1238,39 @@ app.patch('/api/auth/profile', async (req, res) => {
     } catch (err) {
         console.error('Update Profile Error:', err);
         res.status(500).json({ success: false, message: 'Failed to update profile' });
+    }
+});
+
+// Update employee bank details
+app.patch('/api/auth/bank-details', async (req, res) => {
+    try {
+        const { phone, bankDetails } = req.body;
+
+        if (!phone || !bankDetails) {
+            return res.status(400).json({ success: false, message: 'Phone and Bank Details are required' });
+        }
+
+        const updateParams = {
+            TableName: tableName,
+            Key: { phone },
+            UpdateExpression: 'set bankDetails = :bankDetails, updatedAt = :time',
+            ExpressionAttributeValues: {
+                ':bankDetails': bankDetails,
+                ':time': new Date().toISOString()
+            },
+            ReturnValues: 'ALL_NEW'
+        };
+
+        const result = await ddbDocClient.send(new UpdateCommand(updateParams));
+
+        res.json({
+            success: true,
+            message: 'Bank details updated successfully',
+            user: result.Attributes
+        });
+    } catch (err) {
+        console.error('Update Bank Details Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to update bank details' });
     }
 });
 
