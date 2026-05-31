@@ -1469,6 +1469,35 @@ app.get('/api/employee/stats/:empId', async (req, res) => {
 
 // --- Admin Routes ---
 
+// Get all orders (for admin panel)
+app.get('/api/admin/orders', async (req, res) => {
+    try {
+        const snapshot = await ordersCol.orderBy('createdAt', 'desc').limit(200).get();
+        const orders = snapshot.docs.map(doc => doc.data());
+
+        // Compute summary stats
+        const totalOrders = orders.filter(o => o.status !== 'pending_payment').length;
+        const activeOrders = orders.filter(o => ['placed', 'accepted', 'preparing', 'on_the_way', 'confirmed'].includes(o.status)).length;
+        const totalRevenue = orders
+            .filter(o => o.status === 'delivered')
+            .reduce((sum, o) => sum + (parseFloat(o.totalAmount) || 0), 0);
+
+        res.json({
+            success: true,
+            count: orders.length,
+            summary: {
+                totalOrders,
+                activeOrders,
+                totalRevenue: Math.round(totalRevenue)
+            },
+            data: orders
+        });
+    } catch (err) {
+        console.error('Fetch Admin Orders Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to fetch orders' });
+    }
+});
+
 // Get all users (customers)
 app.get('/api/admin/users', async (req, res) => {
     try {
