@@ -1699,6 +1699,45 @@ app.post('/api/admin/employees/:phone/can-prepared', async (req, res) => {
     }
 });
 
+// Rider checks their current prepared can status
+app.get('/api/employees/:phone/can-status', async (req, res) => {
+    try {
+        const { phone } = req.params;
+        let riderStatus = null;
+        for (const [_, rider] of onlineRiders.entries()) {
+            if (rider.employeePhone === phone) {
+                riderStatus = {
+                    canRequestStatus: rider.canRequestStatus || 'none',
+                    preparedCanId: rider.preparedCanId || null,
+                    canHistory: rider.canHistory || []
+                };
+                break;
+            }
+        }
+        
+        if (!riderStatus) {
+            const snapshot = await db.collection('online_riders').where('employeePhone', '==', phone).get();
+            if (!snapshot.empty) {
+                const rData = snapshot.docs[0].data();
+                riderStatus = {
+                    canRequestStatus: rData.canRequestStatus || 'none',
+                    preparedCanId: rData.preparedCanId || null,
+                    canHistory: rData.canHistory || []
+                };
+            }
+        }
+
+        if (riderStatus) {
+            res.json({ success: true, ...riderStatus });
+        } else {
+            res.status(404).json({ success: false, message: 'Rider session not found' });
+        }
+    } catch (err) {
+        console.error('Fetch Can Status Error:', err);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
 // Rider receives and scans the new prepared can at office
 app.post('/api/admin/employees/:phone/can-received', async (req, res) => {
     try {
