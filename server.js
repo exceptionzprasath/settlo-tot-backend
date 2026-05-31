@@ -439,7 +439,7 @@ app.post('/api/orders', async (req, res) => {
             // Dispatch immediately to nearby riders via Firestore geofencing + socket
             dispatchToNearbyRiders(orderData);
 
-            // Start unassigned timeout of 30 seconds
+            // Start unassigned timeout of 1 minute (60 seconds)
             setTimeout(async () => {
                 try {
                     const orderRef = ordersCol.doc(orderId);
@@ -462,7 +462,7 @@ app.post('/api/orders', async (req, res) => {
                 } catch (timeoutErr) {
                     console.error(`Error in COD order ${orderId} timeout:`, timeoutErr);
                 }
-            }, 30000);
+            }, 60000);
 
             return res.json({
                 success: true,
@@ -603,7 +603,7 @@ app.get('/api/payments/verify', async (req, res) => {
             // 3. Dispatch to nearby riders
             dispatchToNearbyRiders(updatedOrderData);
             
-            // 4. Set order timeout (30s) just like we did originally
+            // 4. Set order timeout of 1 minute (60 seconds)
             setTimeout(async () => {
                 try {
                     const checkDoc = await orderRef.get();
@@ -612,20 +612,47 @@ app.get('/api/payments/verify', async (req, res) => {
                         if (currentOrder.status === 'placed') {
                             await orderRef.update({
                                 status: 'unassigned',
+                                refundStatus: 'initiated',
                                 updatedAt: new Date().toISOString()
                             });
-                            console.log(`⏰ [Order Timeout] Paid Order #${orderId} expired without rider acceptance.`);
+                            console.log(`⏰ [Order Timeout] Paid Order #${orderId} expired without rider acceptance. Initiating refund...`);
                             io.to(`customer_${currentOrder.customerPhone}`).emit('order_status_update', {
                                 orderId,
                                 status: 'unassigned'
                             });
                             io.to('riders').emit('order_expired', { orderId });
+
+                            // Trigger automatic Razorpay Refund
+                            if (currentOrder.paymentMode === 'online' && currentOrder.paymentStatus === 'paid' && currentOrder.razorpayPaymentId) {
+                                try {
+                                    console.log(`💸 [Refund] Triggering automatic refund for Order #${orderId} (Payment ID: ${currentOrder.razorpayPaymentId})...`);
+                                    const refundResponse = await razorpay.payments.refund(currentOrder.razorpayPaymentId, {
+                                        notes: {
+                                            reason: "Order unassigned - no riders accepted within 1 minute time limit",
+                                            orderId: orderId
+                                        }
+                                    });
+                                    console.log(`✅ [Refund Successful] Refund ID: ${refundResponse.id} for Order #${orderId}`);
+                                    await orderRef.update({
+                                        refundStatus: 'refunded',
+                                        refundId: refundResponse.id,
+                                        updatedAt: new Date().toISOString()
+                                    });
+                                } catch (refundErr) {
+                                    console.error(`❌ [Refund Failed] Razorpay error for Order #${orderId}:`, refundErr.message);
+                                    await orderRef.update({
+                                        refundStatus: 'failed',
+                                        refundError: refundErr.message,
+                                        updatedAt: new Date().toISOString()
+                                    });
+                                }
+                            }
                         }
                     }
                 } catch (timeoutErr) {
                     console.error(`Error in paid order ${orderId} timeout:`, timeoutErr);
                 }
-            }, 30000);
+            }, 60000);
 
             // If JSON response is requested by the brand website, return verified order details
             if (req.query.format === 'json') {
