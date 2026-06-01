@@ -1421,18 +1421,32 @@ app.get('/api/employee/stats/:empId', async (req, res) => {
             weeklyEarnings = weeklyTeas * rate;
             monthlyEarnings = monthlyTeas * rate;
         } else {
-            // Full-time: Check if achieved early shift ₹250 incentive target on those days
-            todayEarnings = (todayTeas >= 360) ? 250 : 0;
+            // Full-time: Check today's incentive
+            const todayStr = now.toISOString().split('T')[0];
+            const todayLog = workHistory[todayStr];
+            if (todayLog) {
+                todayEarnings = todayLog.incentiveEarned === true ? 250 : 0;
+            } else {
+                // If they are still online
+                let timeElapsedMs = 0;
+                if (activeRider && activeRider.onlineSince) {
+                    timeElapsedMs = Date.now() - new Date(activeRider.onlineSince).getTime();
+                }
+                todayEarnings = (todayTeas >= 360 && timeElapsedMs > 0 && timeElapsedMs <= 6 * 60 * 60 * 1000) ? 250 : 0;
+            }
             
             // For weekly/monthly, check dynamic achieved dates
             weeklyEarnings = 0;
             monthlyEarnings = 0;
             
             Object.keys(workHistory).forEach(dateStr => {
+                if (dateStr === todayStr) return; // skip today as it's active or handled separately
                 const log = workHistory[dateStr];
                 const dateObj = new Date(dateStr);
                 const sales = parseInt(log.sales || 0, 10);
-                const hitTarget = sales >= 360;
+                
+                // Parse duration or check log.incentiveEarned
+                const hitTarget = log.incentiveEarned === true || (sales >= 360 && (!log.duration || !log.duration.includes('h') || parseFloat(log.duration.split('h')[0]) < 6 || (parseFloat(log.duration.split('h')[0]) === 6 && parseFloat(log.duration.split('h')[1].replace('m','').trim()) === 0)));
 
                 if (dateObj >= startOfWeek) {
                     if (hitTarget) weeklyEarnings += 250;
@@ -1442,8 +1456,8 @@ app.get('/api/employee/stats/:empId', async (req, res) => {
                 }
             });
             
-            // Include active today's shift incentive
-            if (todayTeas >= 360) {
+            // Include today's shift incentive in aggregates
+            if (todayEarnings >= 250) {
                 weeklyEarnings += 250;
                 monthlyEarnings += 250;
             }
