@@ -1140,6 +1140,7 @@ app.post('/api/auth/register', upload.fields([
             vehicleNumber: vehicleNumber || null,
             dateOfJoining: dateOfJoining || null,
             employeeType: employeeType || 'Full Time',
+            registeredEmployeeType: employeeType || 'Full Time',
             // Documents mapping (flexible)
             selfieUrl: (files && (files.selfie || files.profilePhoto)) ? (files.selfie || files.profilePhoto)[0].location : null,
             insuranceUrl: (files && files.insurance) ? files.insurance[0].location : null,
@@ -1271,6 +1272,62 @@ app.patch('/api/auth/bank-details', async (req, res) => {
     } catch (err) {
         console.error('Update Bank Details Error:', err);
         res.status(500).json({ success: false, message: 'Failed to update bank details' });
+    }
+});
+
+// Update employee type (Full Time / Part Time)
+app.patch('/api/auth/employee-type', async (req, res) => {
+    try {
+        const { phone, employeeType } = req.body;
+
+        if (!phone || !employeeType) {
+            return res.status(400).json({ success: false, message: 'Phone and Employee Type are required' });
+        }
+
+        if (employeeType !== 'Full Time' && employeeType !== 'Part Time') {
+            return res.status(400).json({ success: false, message: 'Invalid Employee Type' });
+        }
+
+        // Get the current employee record to check registered type and perform migration if needed
+        const getResult = await ddbDocClient.send(new GetCommand({
+            TableName: tableName,
+            Key: { phone }
+        }));
+
+        if (!getResult.Item) {
+            return res.status(404).json({ success: false, message: 'Employee not found' });
+        }
+
+        const employee = getResult.Item;
+        const currentRegisteredType = employee.registeredEmployeeType || employee.employeeType || 'Full Time';
+
+        // Guard: If registered type is Part Time, they cannot switch to Full Time
+        if (currentRegisteredType === 'Part Time' && employeeType === 'Full Time') {
+            return res.status(400).json({ success: false, message: 'Part-time employees are not eligible to switch to Full-time.' });
+        }
+
+        const updateParams = {
+            TableName: tableName,
+            Key: { phone },
+            UpdateExpression: 'set employeeType = :employeeType, registeredEmployeeType = :registeredType, updatedAt = :time',
+            ExpressionAttributeValues: {
+                ':employeeType': employeeType,
+                ':registeredType': currentRegisteredType,
+                ':time': new Date().toISOString()
+            },
+            ReturnValues: 'ALL_NEW'
+        };
+
+        const result = await ddbDocClient.send(new UpdateCommand(updateParams));
+
+        res.json({
+            success: true,
+            message: `Employee type updated to ${employeeType} successfully`,
+            user: result.Attributes
+        });
+    } catch (err) {
+        console.error('Update Employee Type Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to update employee type' });
     }
 });
 
