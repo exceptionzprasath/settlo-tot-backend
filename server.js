@@ -580,6 +580,11 @@ app.get('/api/payments/verify', async (req, res) => {
         if (generated_signature === razorpay_signature) {
             console.log(`✅ [Payment Verified] Order #${orderId} payment succeeded!`);
             
+            // Check if order contains Flask Tea
+            const hasFlaskTea = order.items?.some(item => 
+                (item.name || '').toLowerCase().includes('flask tea')
+            );
+
             const updatedOrderData = {
                 ...order,
                 status: 'placed',
@@ -587,6 +592,7 @@ app.get('/api/payments/verify', async (req, res) => {
                 paymentMode: 'online',
                 razorpayPaymentId: razorpay_payment_id,
                 razorpaySignature: razorpay_signature,
+                orderType: hasFlaskTea ? 'flask_tea' : 'normal',
                 updatedAt: new Date().toISOString()
             };
             
@@ -600,59 +606,119 @@ app.get('/api/payments/verify', async (req, res) => {
                 order: updatedOrderData
             });
             
-            // 3. Dispatch to nearby riders
-            dispatchToNearbyRiders(updatedOrderData);
-            
-            // 4. Set order timeout of 1 minute (60 seconds)
-            setTimeout(async () => {
-                try {
-                    const checkDoc = await orderRef.get();
-                    if (checkDoc.exists) {
-                        const currentOrder = checkDoc.data();
-                        if (currentOrder.status === 'placed') {
-                            await orderRef.update({
-                                status: 'unassigned',
-                                refundStatus: 'initiated',
-                                updatedAt: new Date().toISOString()
-                            });
-                            console.log(`⏰ [Order Timeout] Paid Order #${orderId} expired without rider acceptance. Initiating refund...`);
-                            io.to(`customer_${currentOrder.customerPhone}`).emit('order_status_update', {
-                                orderId,
-                                status: 'unassigned'
-                            });
-                            io.to('riders').emit('order_expired', { orderId });
+            if (hasFlaskTea) {
+                console.log(`🍵 [Flask Tea Order] Order #${orderId} contains Flask Tea. Dispatching strictly to Corporate Manager (bypassing riders).`);
+                
+                // Broadcast to admin room for Corporate/Super Admin dashboard updates
+                io.to('admin').emit('new_flask_tea_order', { order: updatedOrderData });
+                
+                // Set order timeout of 5 minutes (300 seconds) for Corporate acceptance
+                setTimeout(async () => {
+                    try {
+                        const checkDoc = await orderRef.get();
+                        if (checkDoc.exists) {
+                            const currentOrder = checkDoc.data();
+                            if (currentOrder.status === 'placed') {
+                                await orderRef.update({
+                                    status: 'expired',
+                                    refundStatus: 'initiated',
+                                    updatedAt: new Date().toISOString()
+                                });
+                                console.log(`⏰ [Flask Tea Timeout] Paid Flask Tea Order #${orderId} expired without Corporate Manager acceptance. Initiating refund...`);
+                                io.to(`customer_${currentOrder.customerPhone}`).emit('order_status_update', {
+                                    orderId,
+                                    status: 'expired'
+                                });
+                                io.to('admin').emit('order_update', { orderId, status: 'expired' });
 
-                            // Trigger automatic Razorpay Refund
-                            if (currentOrder.paymentMode === 'online' && currentOrder.paymentStatus === 'paid' && currentOrder.razorpayPaymentId) {
-                                try {
-                                    console.log(`💸 [Refund] Triggering automatic refund for Order #${orderId} (Payment ID: ${currentOrder.razorpayPaymentId})...`);
-                                    const refundResponse = await razorpay.payments.refund(currentOrder.razorpayPaymentId, {
-                                        notes: {
-                                            reason: "Order unassigned - no riders accepted within 1 minute time limit",
-                                            orderId: orderId
-                                        }
-                                    });
-                                    console.log(`✅ [Refund Successful] Refund ID: ${refundResponse.id} for Order #${orderId}`);
-                                    await orderRef.update({
-                                        refundStatus: 'refunded',
-                                        refundId: refundResponse.id,
-                                        updatedAt: new Date().toISOString()
-                                    });
-                                } catch (refundErr) {
-                                    console.error(`❌ [Refund Failed] Razorpay error for Order #${orderId}:`, refundErr.message);
-                                    await orderRef.update({
-                                        refundStatus: 'failed',
-                                        refundError: refundErr.message,
-                                        updatedAt: new Date().toISOString()
-                                    });
+                                // Trigger automatic Razorpay Refund
+                                if (currentOrder.paymentMode === 'online' && currentOrder.paymentStatus === 'paid' && currentOrder.razorpayPaymentId) {
+                                    try {
+                                        console.log(`💸 [Refund] Triggering automatic refund for Order #${orderId} (Payment ID: ${currentOrder.razorpayPaymentId})...`);
+                                        const refundResponse = await razorpay.payments.refund(currentOrder.razorpayPaymentId, {
+                                            notes: {
+                                                reason: "Flask Tea Order expired - Corporate Manager did not accept within 5 minutes time limit",
+                                                orderId: orderId
+                                            }
+                                        });
+                                        console.log(`✅ [Refund Successful] Refund ID: ${refundResponse.id} for Order #${orderId}`);
+                                        await orderRef.update({
+                                            refundStatus: 'refunded',
+                                            refundId: refundResponse.id,
+                                            refundedAt: new Date().toISOString(),
+                                            updatedAt: new Date().toISOString()
+                                        });
+                                    } catch (refundErr) {
+                                        console.error(`❌ [Refund Failed] Razorpay error for Order #${orderId}:`, refundErr.message);
+                                        await orderRef.update({
+                                            refundStatus: 'failed',
+                                            refundError: refundErr.message,
+                                            updatedAt: new Date().toISOString()
+                                        });
+                                    }
                                 }
                             }
                         }
+                    } catch (timeoutErr) {
+                        console.error(`Error in paid order ${orderId} timeout:`, timeoutErr);
                     }
-                } catch (timeoutErr) {
-                    console.error(`Error in paid order ${orderId} timeout:`, timeoutErr);
-                }
-            }, 60000);
+                }, 300000); // 5 minutes
+                
+            } else {
+                // 3. Dispatch to nearby riders for normal tea
+                dispatchToNearbyRiders(updatedOrderData);
+                
+                // 4. Set order timeout of 1 minute (60 seconds) for riders
+                setTimeout(async () => {
+                    try {
+                        const checkDoc = await orderRef.get();
+                        if (checkDoc.exists) {
+                            const currentOrder = checkDoc.data();
+                            if (currentOrder.status === 'placed') {
+                                await orderRef.update({
+                                    status: 'unassigned',
+                                    refundStatus: 'initiated',
+                                    updatedAt: new Date().toISOString()
+                                });
+                                console.log(`⏰ [Order Timeout] Paid Order #${orderId} expired without rider acceptance. Initiating refund...`);
+                                io.to(`customer_${currentOrder.customerPhone}`).emit('order_status_update', {
+                                    orderId,
+                                    status: 'unassigned'
+                                });
+                                io.to('riders').emit('order_expired', { orderId });
+
+                                // Trigger automatic Razorpay Refund
+                                if (currentOrder.paymentMode === 'online' && currentOrder.paymentStatus === 'paid' && currentOrder.razorpayPaymentId) {
+                                    try {
+                                        console.log(`💸 [Refund] Triggering automatic refund for Order #${orderId} (Payment ID: ${currentOrder.razorpayPaymentId})...`);
+                                        const refundResponse = await razorpay.payments.refund(currentOrder.razorpayPaymentId, {
+                                            notes: {
+                                                reason: "Order unassigned - no riders accepted within 1 minute time limit",
+                                                orderId: orderId
+                                            }
+                                        });
+                                        console.log(`✅ [Refund Successful] Refund ID: ${refundResponse.id} for Order #${orderId}`);
+                                        await orderRef.update({
+                                            refundStatus: 'refunded',
+                                            refundId: refundResponse.id,
+                                            updatedAt: new Date().toISOString()
+                                        });
+                                    } catch (refundErr) {
+                                        console.error(`❌ [Refund Failed] Razorpay error for Order #${orderId}:`, refundErr.message);
+                                        await orderRef.update({
+                                            refundStatus: 'failed',
+                                            refundError: refundErr.message,
+                                            updatedAt: new Date().toISOString()
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    } catch (timeoutErr) {
+                        console.error(`Error in paid order ${orderId} timeout:`, timeoutErr);
+                    }
+                }, 60000);
+            }
 
             // If JSON response is requested by the brand website, return verified order details
             if (req.query.format === 'json') {
@@ -930,6 +996,89 @@ app.patch('/api/orders/:id/status', async (req, res) => {
         res.json({ success: true, message: 'Order delivered', data: orderData });
     } catch (err) {
         console.error('Update Status Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to update status' });
+    }
+});
+
+// Admin status update route (specifically for Corporate/Super Admin handling Flask Tea or override orders)
+app.patch('/api/admin/orders/:id/status', async (req, res) => {
+    try {
+        const { status } = req.body;
+        const orderId = req.params.id;
+
+        if (!['confirmed', 'delivered', 'expired', 'unassigned'].includes(status)) {
+            return res.status(400).json({ success: false, message: 'Invalid status update. Allowed: confirmed, delivered, expired, unassigned' });
+        }
+
+        const updateData = {
+            status,
+            updatedAt: new Date().toISOString()
+        };
+
+        if (status === 'confirmed') {
+            updateData.confirmedAt = new Date().toISOString();
+        } else if (status === 'delivered') {
+            updateData.deliveredAt = new Date().toISOString();
+        }
+
+        await ordersCol.doc(orderId).update(updateData);
+
+        const updatedDoc = await ordersCol.doc(orderId).get();
+        const orderData = updatedDoc.data();
+
+        // Broadcast status update to the customer socket room
+        if (orderData.customerPhone) {
+            io.to(`customer_${orderData.customerPhone}`).emit('order_status_update', {
+                orderId,
+                status,
+                order: orderData
+            });
+            console.log(`📤 Notified customer ${orderData.customerPhone} of status override: ${status}`);
+        }
+        
+        io.to('admin').emit('order_update', { orderId, status, order: orderData });
+
+        // Trigger automatic Razorpay Refund if status set to expired or unassigned
+        if ((status === 'expired' || status === 'unassigned') && orderData.paymentMode === 'online' && orderData.paymentStatus === 'paid' && orderData.razorpayPaymentId) {
+            try {
+                console.log(`💸 [Refund] Corporate manager initiated refund for Order #${orderId} (Payment ID: ${orderData.razorpayPaymentId})...`);
+                const refundResponse = await razorpay.payments.refund(orderData.razorpayPaymentId, {
+                    notes: {
+                        reason: "Order declined by Corporate Manager",
+                        orderId: orderId
+                    }
+                });
+                console.log(`✅ [Refund Successful] Refund ID: ${refundResponse.id} for Order #${orderId}`);
+                
+                // Save refund status and time in Firestore
+                const refundTime = new Date().toISOString();
+                await ordersCol.doc(orderId).update({
+                    refundStatus: 'refunded',
+                    refundId: refundResponse.id,
+                    refundedAt: refundTime,
+                    updatedAt: refundTime
+                });
+                
+                // Fetch final state and broadcast to customer room
+                const finalDoc = await ordersCol.doc(orderId).get();
+                io.to(`customer_${orderData.customerPhone}`).emit('order_status_update', {
+                    orderId,
+                    status,
+                    order: finalDoc.data()
+                });
+            } catch (refundErr) {
+                console.error(`❌ [Refund Failed] Razorpay error for Order #${orderId}:`, refundErr.message);
+                await ordersCol.doc(orderId).update({
+                    refundStatus: 'failed',
+                    refundError: refundErr.message,
+                    updatedAt: new Date().toISOString()
+                });
+            }
+        }
+
+        res.json({ success: true, message: `Order status updated to ${status}`, data: orderData });
+    } catch (err) {
+        console.error('Corporate Update Status Error:', err);
         res.status(500).json({ success: false, message: 'Failed to update status' });
     }
 });
