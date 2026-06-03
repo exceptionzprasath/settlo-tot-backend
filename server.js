@@ -1434,6 +1434,13 @@ app.post('/api/auth/login', async (req, res) => {
                 });
             }
 
+            if (employee.status === 'rejected') {
+                return res.json({
+                    success: false,
+                    message: `Your registration was rejected. Reason: ${employee.rejectionReason || 'No reason specified'}`
+                });
+            }
+
             res.json({
                 success: true,
                 message: 'Login successful',
@@ -2355,21 +2362,33 @@ app.get('/api/admin/applications/pending', async (req, res) => {
 app.post('/api/admin/applications/:phone/status', async (req, res) => {
     try {
         const { phone } = req.params;
-        const { status } = req.body;
+        const { status, reason } = req.body;
 
         if (!['active', 'rejected', 'suspended'].includes(status)) {
             return res.status(400).json({ success: false, message: 'Invalid status. Must be active, rejected, or suspended' });
         }
 
+        const ExpressionAttributeNames = { '#status': 'status' };
+        const ExpressionAttributeValues = {
+            ':status': status,
+            ':time': new Date().toISOString()
+        };
+        let UpdateExpression = 'set #status = :status, updatedAt = :time';
+
+        if (status === 'rejected') {
+            UpdateExpression += ', rejectionReason = :reason';
+            ExpressionAttributeValues[':reason'] = reason || 'No reason specified';
+        } else if (status === 'active') {
+            UpdateExpression += ', rejectionReason = :reason';
+            ExpressionAttributeValues[':reason'] = '';
+        }
+
         const updateParams = {
             TableName: tableName,
             Key: { phone },
-            UpdateExpression: 'set #status = :status, updatedAt = :time',
-            ExpressionAttributeNames: { '#status': 'status' },
-            ExpressionAttributeValues: {
-                ':status': status,
-                ':time': new Date().toISOString()
-            },
+            UpdateExpression,
+            ExpressionAttributeNames,
+            ExpressionAttributeValues,
             ReturnValues: 'ALL_NEW'
         };
 
