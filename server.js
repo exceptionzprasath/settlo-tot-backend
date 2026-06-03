@@ -439,7 +439,7 @@ app.post('/api/orders', async (req, res) => {
             // Dispatch immediately to nearby riders via Firestore geofencing + socket
             dispatchToNearbyRiders(orderData);
 
-            // Start unassigned timeout of 1 minute (60 seconds)
+            // Start unassigned timeout of 5 minutes (300 seconds)
             setTimeout(async () => {
                 try {
                     const orderRef = ordersCol.doc(orderId);
@@ -462,7 +462,7 @@ app.post('/api/orders', async (req, res) => {
                 } catch (timeoutErr) {
                     console.error(`Error in COD order ${orderId} timeout:`, timeoutErr);
                 }
-            }, 60000);
+            }, 300000);
 
             return res.json({
                 success: true,
@@ -668,7 +668,7 @@ app.get('/api/payments/verify', async (req, res) => {
                 // 3. Dispatch to nearby riders for normal tea
                 dispatchToNearbyRiders(updatedOrderData);
                 
-                // 4. Set order timeout of 1 minute (60 seconds) for riders
+                // 4. Set order timeout of 5 minutes (300 seconds) for riders
                 setTimeout(async () => {
                     try {
                         const checkDoc = await orderRef.get();
@@ -693,7 +693,7 @@ app.get('/api/payments/verify', async (req, res) => {
                                         console.log(`💸 [Refund] Triggering automatic refund for Order #${orderId} (Payment ID: ${currentOrder.razorpayPaymentId})...`);
                                         const refundResponse = await razorpay.payments.refund(currentOrder.razorpayPaymentId, {
                                             notes: {
-                                                reason: "Order unassigned - no riders accepted within 1 minute time limit",
+                                                reason: "Order unassigned - no riders accepted within 5 minutes time limit",
                                                 orderId: orderId
                                             }
                                         });
@@ -717,7 +717,7 @@ app.get('/api/payments/verify', async (req, res) => {
                     } catch (timeoutErr) {
                         console.error(`Error in paid order ${orderId} timeout:`, timeoutErr);
                     }
-                }, 60000);
+                }, 300000);
             }
 
             // If JSON response is requested by the brand website, return verified order details
@@ -1814,7 +1814,18 @@ app.get('/api/admin/orders', async (req, res) => {
 app.get('/api/admin/orders/analytics-data', async (req, res) => {
     try {
         const limitVal = parseInt(req.query.limit) || 1000;
-        const snapshot = await ordersCol.orderBy('createdAt', 'desc').limit(limitVal).get();
+        const { startDate, endDate } = req.query;
+        
+        let query = ordersCol.orderBy('createdAt', 'desc');
+        
+        if (startDate) {
+            query = query.where('createdAt', '>=', `${startDate}T00:00:00.000Z`);
+        }
+        if (endDate) {
+            query = query.where('createdAt', '<=', `${endDate}T23:59:59.999Z`);
+        }
+
+        const snapshot = await query.limit(limitVal).get();
         const orders = snapshot.docs.map(doc => {
             const data = doc.data();
             return {
@@ -1834,8 +1845,40 @@ app.get('/api/admin/orders/analytics-data', async (req, res) => {
             data: orders
         });
     } catch (err) {
-        console.error('Fetch Orders Analytics Error:', err);
-        res.status(500).json({ success: false, message: 'Failed to fetch analytics data' });
+        console.error('Fetch Orders Analytics Error (Attempting self-healing fallback):', err);
+        try {
+            const limitVal = parseInt(req.query.limit) || 1000;
+            const snapshot = await ordersCol.orderBy('createdAt', 'desc').limit(limitVal).get();
+            let orders = snapshot.docs.map(doc => {
+                const data = doc.data();
+                return {
+                    id: data.id,
+                    lat: parseFloat(data.customerLocation?.latitude),
+                    lng: parseFloat(data.customerLocation?.longitude),
+                    status: data.status,
+                    refundStatus: data.refundStatus,
+                    totalAmount: parseFloat(data.totalAmount) || 0,
+                    createdAt: data.createdAt
+                };
+            }).filter(o => !isNaN(o.lat) && !isNaN(o.lng));
+
+            if (req.query.startDate) {
+                orders = orders.filter(o => o.createdAt >= `${req.query.startDate}T00:00:00.000Z`);
+            }
+            if (req.query.endDate) {
+                orders = orders.filter(o => o.createdAt <= `${req.query.endDate}T23:59:59.999Z`);
+            }
+
+            res.json({
+                success: true,
+                count: orders.length,
+                data: orders,
+                fallbackFiltered: true
+            });
+        } catch (fallbackErr) {
+            console.error('Fetch Orders Analytics Fallback Error:', fallbackErr);
+            res.status(500).json({ success: false, message: 'Failed to fetch analytics data' });
+        }
     }
 });
 
