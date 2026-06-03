@@ -1314,6 +1314,98 @@ app.post('/api/auth/register', upload.fields([
     }
 });
 
+// Update Employee Details & Documents
+app.put('/api/admin/employees/:phone', upload.fields([
+    { name: 'selfie', maxCount: 1 },
+    { name: 'profilePhoto', maxCount: 1 },
+    { name: 'insurance', maxCount: 1 },
+    { name: 'rc', maxCount: 1 },
+    { name: 'aadhar', maxCount: 1 },
+    { name: 'aadharCard', maxCount: 1 },
+    { name: 'panCard', maxCount: 1 },
+    { name: 'license', maxCount: 1 },
+    { name: 'familyAadhar', maxCount: 1 }
+]), async (req, res) => {
+    try {
+        const { phone } = req.params;
+        const {
+            name, email, empId, address, alternateNumber, gender,
+            vehicleType, vehicleNumber, dateOfJoining, employeeType,
+            familyRelation, instagram, facebook,
+            holderName, bankName, accountNumber, ifscCode, upiId
+        } = req.body;
+        const files = req.files;
+
+        // Fetch existing employee
+        const getResult = await ddbDocClient.send(new GetCommand({
+            TableName: tableName,
+            Key: { phone }
+        }));
+
+        if (!getResult.Item) {
+            return res.status(404).json({ success: false, message: 'Employee not found' });
+        }
+
+        const existingUser = getResult.Item;
+
+        // Construct updated bank details
+        let updatedBankDetails = existingUser.bankDetails || null;
+        if (holderName !== undefined || bankName !== undefined || accountNumber !== undefined || ifscCode !== undefined || upiId !== undefined) {
+            updatedBankDetails = {
+                ...(existingUser.bankDetails || {}),
+                ...(holderName !== undefined && { holderName }),
+                ...(bankName !== undefined && { bankName }),
+                ...(accountNumber !== undefined && { accountNumber }),
+                ...(ifscCode !== undefined && { ifscCode }),
+                ...(upiId !== undefined && { upiId })
+            };
+        }
+
+        // Construct updated user data
+        const updatedUserData = {
+            ...existingUser,
+            ...(name !== undefined && { name }),
+            ...(email !== undefined && { email }),
+            ...(empId !== undefined && { empId }),
+            ...(address !== undefined && { address }),
+            ...(alternateNumber !== undefined && { alternateNumber: alternateNumber || null }),
+            ...(gender !== undefined && { gender: gender || null }),
+            ...(vehicleType !== undefined && { vehicleType: vehicleType || null }),
+            ...(vehicleNumber !== undefined && { vehicleNumber: vehicleNumber || null }),
+            ...(dateOfJoining !== undefined && { dateOfJoining: dateOfJoining || null }),
+            ...(employeeType !== undefined && { 
+                employeeType: employeeType || 'Full Time',
+                registeredEmployeeType: employeeType || 'Full Time'
+            }),
+            ...(familyRelation !== undefined && { familyRelation }),
+            ...(instagram !== undefined && { instagram }),
+            ...(facebook !== undefined && { facebook }),
+            ...(updatedBankDetails !== undefined && { bankDetails: updatedBankDetails }),
+            
+            // Document replacements
+            ...((files && (files.selfie || files.profilePhoto)) && { selfieUrl: (files.selfie || files.profilePhoto)[0].location }),
+            ...((files && files.insurance) && { insuranceUrl: files.insurance[0].location }),
+            ...((files && files.rc) && { rcUrl: files.rc[0].location }),
+            ...((files && (files.aadhar || files.aadharCard)) && { aadharUrl: (files.aadhar || files.aadharCard)[0].location }),
+            ...((files && files.panCard) && { panCardUrl: files.panCard[0].location }),
+            ...((files && files.license) && { licenseUrl: files.license[0].location }),
+            ...((files && files.familyAadhar) && { familyAadharUrl: files.familyAadhar[0].location }),
+            
+            updatedAt: new Date().toISOString()
+        };
+
+        await ddbDocClient.send(new PutCommand({
+            TableName: tableName,
+            Item: updatedUserData
+        }));
+
+        res.json({ success: true, message: 'Employee details and documents updated successfully', user: updatedUserData });
+    } catch (err) {
+        console.error('Update Employee Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to update employee details' });
+    }
+});
+
 // Employee Login
 app.post('/api/auth/login', async (req, res) => {
     try {
@@ -1715,6 +1807,35 @@ app.get('/api/admin/orders', async (req, res) => {
     } catch (err) {
         console.error('Fetch Admin Orders Error:', err);
         res.status(500).json({ success: false, message: 'Failed to fetch orders' });
+    }
+});
+
+// Get order location analytics data (for Sales Analytics map)
+app.get('/api/admin/orders/analytics-data', async (req, res) => {
+    try {
+        const limitVal = parseInt(req.query.limit) || 1000;
+        const snapshot = await ordersCol.orderBy('createdAt', 'desc').limit(limitVal).get();
+        const orders = snapshot.docs.map(doc => {
+            const data = doc.data();
+            return {
+                id: data.id,
+                lat: parseFloat(data.customerLocation?.latitude),
+                lng: parseFloat(data.customerLocation?.longitude),
+                status: data.status,
+                refundStatus: data.refundStatus,
+                totalAmount: parseFloat(data.totalAmount) || 0,
+                createdAt: data.createdAt
+            };
+        }).filter(o => !isNaN(o.lat) && !isNaN(o.lng));
+
+        res.json({
+            success: true,
+            count: orders.length,
+            data: orders
+        });
+    } catch (err) {
+        console.error('Fetch Orders Analytics Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to fetch analytics data' });
     }
 });
 
