@@ -1739,6 +1739,254 @@ app.get('/api/admin/users', async (req, res) => {
     }
 });
 
+// ==================== OFFICE EMPLOYEES ENDPOINTS ====================
+
+// Register Office Employee (w/ optional AWS Rekognition Face Indexing)
+app.post('/api/admin/office-employees', upload.fields([
+    { name: 'photo', maxCount: 1 }
+]), async (req, res) => {
+    try {
+        const { name, phone, employeeCode, role, shiftFrom, shiftTo, faceRegister } = req.body;
+        const files = req.files;
+
+        if (!name || !phone || !employeeCode || !role || !shiftFrom || !shiftTo) {
+            return res.status(400).json({ success: false, message: 'All fields are required.' });
+        }
+
+        const photoUrl = (files && files.photo) ? files.photo[0].location : null;
+        let faceRegistered = false;
+        let faceId = null;
+
+        // AWS Rekognition Face Registration Option
+        if (faceRegister === 'true' && photoUrl && files && files.photo) {
+            try {
+                const { RekognitionClient, IndexFacesCommand, CreateCollectionCommand } = require('@aws-sdk/client-rekognition');
+                const { bucketName } = require('./config/awsConfig');
+                
+                const rekognitionClient = new RekognitionClient({
+                    region: process.env.AWS_REGION || 'ap-south-1',
+                    credentials: {
+                        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+                        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+                    }
+                });
+
+                const s3Key = files.photo[0].key;
+                const collectionId = 'office_employees_collection';
+
+                console.log(`🤖 [Rekognition] Indexing face for S3 Key: ${s3Key} in bucket: ${bucketName}...`);
+
+                let indexResponse;
+                try {
+                    indexResponse = await rekognitionClient.send(new IndexFacesCommand({
+                        CollectionId: collectionId,
+                        Image: {
+                            S3Object: {
+                                Bucket: bucketName,
+                                Name: s3Key
+                            }
+                        },
+                        ExternalImageId: employeeCode.replace(/[^a-zA-Z0-9_.\-:]/g, '_'), // AWS ExternalImageId validation sanitization
+                        DetectionAttributes: ['DEFAULT']
+                    }));
+                } catch (idxErr) {
+                    if (idxErr.name === 'ResourceNotFoundException') {
+                        console.log(`🔍 [Rekognition] Collection '${collectionId}' not found. Creating it...`);
+                        await rekognitionClient.send(new CreateCollectionCommand({
+                            CollectionId: collectionId
+                        }));
+                        console.log(`✅ [Rekognition] Collection '${collectionId}' created successfully.`);
+                        // Retry indexing
+                        indexResponse = await rekognitionClient.send(new IndexFacesCommand({
+                            CollectionId: collectionId,
+                            Image: {
+                                S3Object: {
+                                    Bucket: bucketName,
+                                    Name: s3Key
+                                }
+                            },
+                            ExternalImageId: employeeCode.replace(/[^a-zA-Z0-9_.\-:]/g, '_'),
+                            DetectionAttributes: ['DEFAULT']
+                        }));
+                    } else {
+                        throw idxErr;
+                    }
+                }
+
+                if (indexResponse && indexResponse.FaceRecords && indexResponse.FaceRecords.length > 0) {
+                    faceRegistered = true;
+                    faceId = indexResponse.FaceRecords[0].Face.FaceId;
+                    console.log(`✅ [Rekognition] Face indexed successfully! FaceId: ${faceId}`);
+                } else {
+                    console.log(`⚠️ [Rekognition] No face detected in the uploaded image.`);
+                }
+            } catch (rekogErr) {
+                console.error(`❌ [Rekognition Error] Face registration failed:`, rekogErr.message);
+                // Fallback: set faceRegistered to false but proceed with registering the employee in DB
+                faceRegistered = false;
+            }
+        }
+
+        const employeeData = {
+            id: employeeCode,
+            name,
+            phone,
+            employeeCode,
+            role,
+            shiftFrom,
+            shiftTo,
+            photoUrl,
+            faceRegistered,
+            faceId,
+            status: 'active',
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+        };
+
+        await db.collection('office_employees').doc(employeeCode).set(employeeData);
+
+        res.json({ success: true, message: 'Office Employee registered successfully', data: employeeData });
+    } catch (err) {
+        console.error('Office Employee Registration Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to register office employee' });
+    }
+});
+
+// Fetch all Office Employees
+app.get('/api/admin/office-employees', async (req, res) => {
+    try {
+        const snapshot = await db.collection('office_employees').get();
+        const employees = [];
+        snapshot.forEach(doc => {
+            employees.push(doc.data());
+        });
+        res.json({ success: true, count: employees.length, data: employees });
+    } catch (err) {
+        console.error('Fetch Office Employees Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to fetch office employees' });
+    }
+});
+
+// Update Office Employee Status
+app.patch('/api/admin/office-employees/:id/status', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { status } = req.body;
+
+        if (!['active', 'suspended', 'offline', 'online'].includes(status)) {
+            return res.status(400).json({ success: false, message: 'Invalid status' });
+        }
+
+        await db.collection('office_employees').doc(id).update({
+            status,
+            updatedAt: new Date().toISOString()
+        });
+
+        res.json({ success: true, message: `Status updated to ${status}` });
+    } catch (err) {
+        console.error('Update Office Employee Status Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to update status' });
+    }
+});
+
+// Delete Office Employee
+app.delete('/api/admin/office-employees/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        
+        try {
+            const doc = await db.collection('office_employees').doc(id).get();
+            if (doc.exists) {
+                const emp = doc.data();
+                if (emp.faceRegistered && emp.faceId) {
+                    const { RekognitionClient, DeleteFacesCommand } = require('@aws-sdk/client-rekognition');
+                    const rekognitionClient = new RekognitionClient({
+                        region: process.env.AWS_REGION || 'ap-south-1',
+                        credentials: {
+                            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+                            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+                        }
+                    });
+                    await rekognitionClient.send(new DeleteFacesCommand({
+                        CollectionId: 'office_employees_collection',
+                        FaceIds: [emp.faceId]
+                    }));
+                    console.log(`✅ [Rekognition] Deleted face ID ${emp.faceId} from collection.`);
+                }
+            }
+        } catch (rekogErr) {
+            console.error('Error deleting face from Rekognition during employee deletion:', rekogErr.message);
+        }
+
+        await db.collection('office_employees').doc(id).delete();
+        res.json({ success: true, message: 'Office Employee deleted successfully' });
+    } catch (err) {
+        console.error('Delete Office Employee Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to delete employee' });
+    }
+});
+
+// Record Office Employee Attendance
+app.post('/api/admin/office-attendance', async (req, res) => {
+    try {
+        const { employeeCode, status } = req.body;
+        const todayStr = new Date().toISOString().split('T')[0];
+        
+        if (!employeeCode || !status) {
+            return res.status(400).json({ success: false, message: 'employeeCode and status are required' });
+        }
+
+        const empDoc = await db.collection('office_employees').doc(employeeCode).get();
+        if (!empDoc.exists) {
+            return res.status(404).json({ success: false, message: 'Employee not found' });
+        }
+        const emp = empDoc.data();
+
+        let checkInTime = '--';
+        if (status === 'On Time') {
+            checkInTime = '08:55 AM';
+        } else if (status === 'Late') {
+            checkInTime = '09:25 AM';
+        }
+
+        const attendanceData = {
+            id: `${employeeCode}_${todayStr}`,
+            employeeCode,
+            name: emp.name,
+            role: emp.role,
+            date: todayStr,
+            checkInTime,
+            status,
+            updatedAt: new Date().toISOString()
+        };
+
+        await db.collection('office_attendance').doc(attendanceData.id).set(attendanceData);
+        res.json({ success: true, message: 'Attendance recorded successfully', data: attendanceData });
+    } catch (err) {
+        console.error('Office Attendance Record Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to record attendance' });
+    }
+});
+
+// Fetch Today's Office Attendance
+app.get('/api/admin/office-attendance/today', async (req, res) => {
+    try {
+        const todayStr = new Date().toISOString().split('T')[0];
+        const snapshot = await db.collection('office_attendance').where('date', '==', todayStr).get();
+        const attendance = {};
+        snapshot.forEach(doc => {
+            const data = doc.data();
+            attendance[data.employeeCode] = data;
+        });
+        res.json({ success: true, date: todayStr, data: attendance });
+    } catch (err) {
+        console.error('Fetch Today Office Attendance Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to fetch attendance' });
+    }
+});
+
+// ==================== ORIGINAL EMPLOYEES ROUTES ====================
+
 // Get active and suspended employees
 app.get('/api/admin/employees/active', async (req, res) => {
     try {
