@@ -1927,10 +1927,11 @@ app.delete('/api/admin/office-employees/:id', async (req, res) => {
 });
 
 // Record Office Employee Attendance
+// Record Office Employee Attendance (Manual Override)
 app.post('/api/admin/office-attendance', async (req, res) => {
     try {
-        const { employeeCode, status } = req.body;
-        const todayStr = new Date().toISOString().split('T')[0];
+        const { employeeCode, status, reason, date } = req.body;
+        const todayStr = date || new Date().toISOString().split('T')[0];
         
         if (!employeeCode || !status) {
             return res.status(400).json({ success: false, message: 'employeeCode and status are required' });
@@ -1957,10 +1958,11 @@ app.post('/api/admin/office-attendance', async (req, res) => {
             date: todayStr,
             checkInTime,
             status,
+            reason: reason || '',
             updatedAt: new Date().toISOString()
         };
 
-        await db.collection('office_attendance').doc(attendanceData.id).set(attendanceData);
+        await db.collection('office_attendance').doc(attendanceData.id).set(attendanceData, { merge: true });
         res.json({ success: true, message: 'Attendance recorded successfully', data: attendanceData });
     } catch (err) {
         console.error('Office Attendance Record Error:', err);
@@ -1968,20 +1970,171 @@ app.post('/api/admin/office-attendance', async (req, res) => {
     }
 });
 
-// Fetch Today's Office Attendance
+// Fetch Office Attendance (Supports Today or Custom Date)
 app.get('/api/admin/office-attendance/today', async (req, res) => {
     try {
-        const todayStr = new Date().toISOString().split('T')[0];
-        const snapshot = await db.collection('office_attendance').where('date', '==', todayStr).get();
+        const dateStr = req.query.date || new Date().toISOString().split('T')[0];
+        const snapshot = await db.collection('office_attendance').where('date', '==', dateStr).get();
         const attendance = {};
         snapshot.forEach(doc => {
             const data = doc.data();
             attendance[data.employeeCode] = data;
         });
-        res.json({ success: true, date: todayStr, data: attendance });
+        res.json({ success: true, date: dateStr, data: attendance });
     } catch (err) {
-        console.error('Fetch Today Office Attendance Error:', err);
+        console.error('Fetch Office Attendance Error:', err);
         res.status(500).json({ success: false, message: 'Failed to fetch attendance' });
+    }
+});
+
+// Record Biometric Face-Matching Check-In/Out
+app.post('/api/admin/office-attendance/biometric', upload.fields([
+    { name: 'photo', maxCount: 1 }
+]), async (req, res) => {
+    try {
+        const { employeeCode, action } = req.body; // action: 'in' or 'out'
+        const files = req.files;
+
+        if (!employeeCode || !action) {
+            return res.status(400).json({ success: false, message: 'employeeCode and action are required.' });
+        }
+
+        const photoUrl = (files && files.photo) ? files.photo[0].location : null;
+        if (!photoUrl || !files || !files.photo) {
+            return res.status(400).json({ success: false, message: 'Camera photo capture is required.' });
+        }
+
+        const empDoc = await db.collection('office_employees').doc(employeeCode).get();
+        if (!empDoc.exists) {
+            return res.status(404).json({ success: false, message: 'Employee not found.' });
+        }
+        const emp = empDoc.data();
+
+        if (!emp.faceRegistered || !emp.faceId) {
+            return res.status(400).json({ success: false, message: 'No registered face profile found for this employee. Please register employee face profile first.' });
+        }
+
+        // Perform AWS Rekognition Face Match search
+        const { RekognitionClient, SearchFacesByImageCommand } = require('@aws-sdk/client-rekognition');
+        const { bucketName } = require('./config/awsConfig');
+        
+        const rekognitionClient = new RekognitionClient({
+            region: process.env.AWS_REGION || 'ap-south-1',
+            credentials: {
+                accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+                secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+            }
+        });
+
+        const s3Key = files.photo[0].key;
+        const collectionId = 'office_employees_collection';
+
+        console.log(`🤖 [Biometric API] Verification face matching for S3 Key: ${s3Key} in bucket: ${bucketName}...`);
+
+        let searchResponse;
+        try {
+            searchResponse = await rekognitionClient.send(new SearchFacesByImageCommand({
+                CollectionId: collectionId,
+                Image: {
+                    S3Object: {
+                        Bucket: bucketName,
+                        Name: s3Key
+                    }
+                },
+                MaxFaces: 1,
+                FaceMatchThreshold: 85
+            }));
+        } catch (searchErr) {
+            console.error('Rekognition verification search error:', searchErr);
+            return res.status(400).json({ success: false, message: 'Face verification failed: ' + searchErr.message });
+        }
+
+        let isMatch = false;
+        let matchConfidence = 0;
+
+        if (searchResponse && searchResponse.FaceMatches && searchResponse.FaceMatches.length > 0) {
+            const match = searchResponse.FaceMatches[0];
+            const matchedExternalId = match.Face.ExternalImageId;
+            const sanitizedCode = employeeCode.replace(/[^a-zA-Z0-9_.\-:]/g, '_');
+            
+            // Check if matched external image ID matches the sanitized employee code, or if the face matches the stored face ID
+            if (matchedExternalId === sanitizedCode || match.Face.FaceId === emp.faceId) {
+                isMatch = true;
+                matchConfidence = match.Similarity;
+                console.log(`✅ [Biometric] Identity confirmed! Confidence similarity: ${matchConfidence}%`);
+            }
+        }
+
+        if (!isMatch) {
+            return res.status(400).json({ success: false, message: 'Face match verification failed. Captured face does not match the registered profile.' });
+        }
+
+        // Face confirmed! Record check in / check out
+        const todayStr = new Date().toISOString().split('T')[0];
+        
+        // Let's get current Indian Standard Time (IST) or system local time for formatting
+        const now = new Date();
+        const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+
+        const attendanceRef = db.collection('office_attendance').doc(`${employeeCode}_${todayStr}`);
+        const attendanceDoc = await attendanceRef.get();
+
+        let attendanceData = {};
+
+        if (action === 'in') {
+            // Determine status based on shiftFrom hour
+            let status = 'On Time';
+            try {
+                const [shiftH, shiftM] = emp.shiftFrom.split(':').map(Number);
+                const currentH = now.getHours();
+                const currentM = now.getMinutes();
+
+                if (currentH > shiftH || (currentH === shiftH && currentM > shiftM + 15)) { // 15 mins grace period
+                    status = 'Late';
+                }
+            } catch (err) {
+                console.error('Shift parsed evaluation failed:', err);
+            }
+
+            attendanceData = {
+                id: `${employeeCode}_${todayStr}`,
+                employeeCode,
+                name: emp.name,
+                role: emp.role,
+                date: todayStr,
+                checkInTime: timeStr,
+                status,
+                reason: '',
+                updatedAt: new Date().toISOString()
+            };
+        } else {
+            // Sign Out
+            const existingData = attendanceDoc.exists ? attendanceDoc.data() : {};
+            attendanceData = {
+                id: `${employeeCode}_${todayStr}`,
+                employeeCode,
+                name: emp.name,
+                role: emp.role,
+                date: todayStr,
+                checkInTime: existingData.checkInTime || '--',
+                checkOutTime: timeStr,
+                status: existingData.status || 'On Time',
+                reason: existingData.reason || '',
+                updatedAt: new Date().toISOString()
+            };
+        }
+
+        await attendanceRef.set(attendanceData, { merge: true });
+        res.json({
+            success: true,
+            message: `Attendance ${action === 'in' ? 'Check-in' : 'Check-out'} recorded successfully.`,
+            confidence: matchConfidence.toFixed(1),
+            data: attendanceData
+        });
+
+    } catch (err) {
+        console.error('Biometric Office Attendance Endpoint Error:', err);
+        res.status(500).json({ success: false, message: 'Internal server error recording biometric check-in.' });
     }
 });
 
