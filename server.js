@@ -2128,7 +2128,7 @@ app.delete('/api/admin/office-employees/:id', async (req, res) => {
 // Record Office Employee Attendance (Manual Override)
 app.post('/api/admin/office-attendance', async (req, res) => {
     try {
-        const { employeeCode, status, reason, date } = req.body;
+        const { employeeCode, status, reason, date, localTime } = req.body;
         const todayStr = date || new Date().toISOString().split('T')[0];
         
         if (!employeeCode || !status) {
@@ -2146,7 +2146,12 @@ app.post('/api/admin/office-attendance', async (req, res) => {
         const existingData = doc.exists ? doc.data() : {};
 
         const now = new Date();
-        const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+        const timeStr = localTime || now.toLocaleTimeString('en-US', {
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: true,
+            timeZone: 'Asia/Kolkata'
+        });
 
         let checkInTime = existingData.checkInTime || '--';
         let checkOutTime = existingData.checkOutTime || '--';
@@ -2207,7 +2212,7 @@ app.post('/api/admin/office-attendance/biometric', upload.fields([
     { name: 'photo', maxCount: 1 }
 ]), async (req, res) => {
     try {
-        const { employeeCode, action } = req.body; // action: 'in' or 'out'
+        const { employeeCode, action, localTime } = req.body; // action: 'in' or 'out'
         const files = req.files;
 
         if (!employeeCode || !action) {
@@ -2289,7 +2294,12 @@ app.post('/api/admin/office-attendance/biometric', upload.fields([
         
         // Let's get current Indian Standard Time (IST) or system local time for formatting
         const now = new Date();
-        const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+        const timeStr = localTime || now.toLocaleTimeString('en-US', {
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: true,
+            timeZone: 'Asia/Kolkata'
+        });
 
         const attendanceRef = db.collection('office_attendance').doc(`${employeeCode}_${todayStr}`);
         const attendanceDoc = await attendanceRef.get();
@@ -2301,8 +2311,10 @@ app.post('/api/admin/office-attendance/biometric', upload.fields([
             let status = 'On Time';
             try {
                 const [shiftH, shiftM] = emp.shiftFrom.split(':').map(Number);
-                const currentH = now.getHours();
-                const currentM = now.getMinutes();
+                const istDateStr = now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
+                const istDate = new Date(istDateStr);
+                const currentH = istDate.getHours();
+                const currentM = istDate.getMinutes();
 
                 if (currentH > shiftH || (currentH === shiftH && currentM > shiftM + 15)) { // 15 mins grace period
                     status = 'Late';
