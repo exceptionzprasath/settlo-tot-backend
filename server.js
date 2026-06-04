@@ -416,6 +416,11 @@ app.post('/api/orders', async (req, res) => {
 
         const isFreeOrder = finalTotalAmount === 0;
         const paymentMethod = req.body.paymentMethod || 'ONLINE'; // 'ONLINE' or 'COD'
+        const hasFlaskTea = items.some(item => 
+            (item.name || '').toLowerCase().includes('flask tea')
+        );
+        const isBulk = req.body.isBulk === true;
+        const isFlaskOrBulk = hasFlaskTea || isBulk;
 
         // Direct order placement (no Razorpay payment) for Cash on Delivery (COD) OR Promotional FREE orders (₹0 total)
         if (paymentMethod === 'COD' || isFreeOrder) {
@@ -429,6 +434,8 @@ app.post('/api/orders', async (req, res) => {
                 paymentMode: isFreeOrder ? 'free' : 'COD',
                 paymentStatus: isFreeOrder ? 'paid' : 'pending',
                 firstTeaFree,
+                orderType: isFlaskOrBulk ? (isBulk ? 'bulk' : 'flask_tea') : 'normal',
+                isBulk: isBulk,
                 createdAt: new Date().toISOString(),
                 updatedAt: new Date().toISOString()
             };
@@ -436,10 +443,15 @@ app.post('/api/orders', async (req, res) => {
             console.log(`💵 [Order] Placing directly (COD/Free) Order #${orderId} | Total: ₹${finalTotalAmount} | Mode: ${orderData.paymentMode}...`);
             await ordersCol.doc(orderId).set(orderData);
 
-            // Dispatch immediately to nearby riders via Firestore geofencing + socket
-            dispatchToNearbyRiders(orderData);
+            if (isFlaskOrBulk) {
+                console.log(`🍵 [Flask/Bulk Order] Order #${orderId} contains Flask/Bulk Tea. Dispatching directly to Corporate Manager.`);
+                io.to('admin').emit('new_flask_tea_order', { order: orderData });
+            } else {
+                // Dispatch immediately to nearby riders via Firestore geofencing + socket
+                dispatchToNearbyRiders(orderData);
+            }
 
-            // Start unassigned timeout of 5 minutes (300 seconds)
+            // Start unassigned/expiry timeout of 5 minutes (300 seconds)
             setTimeout(async () => {
                 try {
                     const orderRef = ordersCol.doc(orderId);
@@ -447,20 +459,33 @@ app.post('/api/orders', async (req, res) => {
                     if (checkDoc.exists) {
                         const currentOrder = checkDoc.data();
                         if (currentOrder.status === 'placed') {
-                            await orderRef.update({
-                                status: 'unassigned',
-                                updatedAt: new Date().toISOString()
-                            });
-                            console.log(`⏰ [Order Timeout] Direct Order #${orderId} expired without rider acceptance.`);
-                            io.to(`customer_${currentOrder.customerPhone}`).emit('order_status_update', {
-                                orderId,
-                                status: 'unassigned'
-                            });
-                            io.to('riders').emit('order_expired', { orderId });
+                            if (isFlaskOrBulk) {
+                                await orderRef.update({
+                                    status: 'expired',
+                                    updatedAt: new Date().toISOString()
+                                });
+                                console.log(`⏰ [Order Timeout] Flask/Bulk COD Order #${orderId} expired without Corporate Manager acceptance.`);
+                                io.to(`customer_${currentOrder.customerPhone}`).emit('order_status_update', {
+                                    orderId,
+                                    status: 'expired'
+                                });
+                                io.to('admin').emit('order_update', { orderId, status: 'expired' });
+                            } else {
+                                await orderRef.update({
+                                    status: 'unassigned',
+                                    updatedAt: new Date().toISOString()
+                                });
+                                console.log(`⏰ [Order Timeout] Direct Order #${orderId} expired without rider acceptance.`);
+                                io.to(`customer_${currentOrder.customerPhone}`).emit('order_status_update', {
+                                    orderId,
+                                    status: 'unassigned'
+                                });
+                                io.to('riders').emit('order_expired', { orderId });
+                            }
                         }
                     }
                 } catch (timeoutErr) {
-                    console.error(`Error in COD order ${orderId} timeout:`, timeoutErr);
+                    console.error(`Error in order ${orderId} timeout:`, timeoutErr);
                 }
             }, 300000);
 
@@ -580,10 +605,12 @@ app.get('/api/payments/verify', async (req, res) => {
         if (generated_signature === razorpay_signature) {
             console.log(`✅ [Payment Verified] Order #${orderId} payment succeeded!`);
             
-            // Check if order contains Flask Tea
+            // Check if order contains Flask Tea or is a Bulk order
             const hasFlaskTea = order.items?.some(item => 
                 (item.name || '').toLowerCase().includes('flask tea')
             );
+            const isBulk = order.isBulk === true;
+            const isFlaskOrBulk = hasFlaskTea || isBulk;
 
             const updatedOrderData = {
                 ...order,
@@ -592,7 +619,8 @@ app.get('/api/payments/verify', async (req, res) => {
                 paymentMode: 'online',
                 razorpayPaymentId: razorpay_payment_id,
                 razorpaySignature: razorpay_signature,
-                orderType: hasFlaskTea ? 'flask_tea' : 'normal',
+                orderType: isFlaskOrBulk ? (isBulk ? 'bulk' : 'flask_tea') : 'normal',
+                isBulk: isBulk,
                 updatedAt: new Date().toISOString()
             };
             
@@ -606,8 +634,8 @@ app.get('/api/payments/verify', async (req, res) => {
                 order: updatedOrderData
             });
             
-            if (hasFlaskTea) {
-                console.log(`🍵 [Flask Tea Order] Order #${orderId} contains Flask Tea. Dispatching strictly to Corporate Manager (bypassing riders).`);
+            if (isFlaskOrBulk) {
+                console.log(`🍵 [Flask/Bulk Order] Order #${orderId} contains Flask/Bulk Tea. Dispatching strictly to Corporate Manager (bypassing riders).`);
                 
                 // Broadcast to admin room for Corporate/Super Admin dashboard updates
                 io.to('admin').emit('new_flask_tea_order', { order: updatedOrderData });
@@ -2097,7 +2125,6 @@ app.delete('/api/admin/office-employees/:id', async (req, res) => {
     }
 });
 
-// Record Office Employee Attendance
 // Record Office Employee Attendance (Manual Override)
 app.post('/api/admin/office-attendance', async (req, res) => {
     try {
@@ -2114,11 +2141,27 @@ app.post('/api/admin/office-attendance', async (req, res) => {
         }
         const emp = empDoc.data();
 
-        let checkInTime = '--';
-        if (status === 'On Time') {
-            checkInTime = '08:55 AM';
-        } else if (status === 'Late') {
-            checkInTime = '09:25 AM';
+        const docRef = db.collection('office_attendance').doc(`${employeeCode}_${todayStr}`);
+        const doc = await docRef.get();
+        const existingData = doc.exists ? doc.data() : {};
+
+        const now = new Date();
+        const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+
+        let checkInTime = existingData.checkInTime || '--';
+        let checkOutTime = existingData.checkOutTime || '--';
+        let finalStatus = status;
+
+        if (status === 'Check Out') {
+            checkOutTime = timeStr;
+            finalStatus = existingData.status || 'On Time';
+        } else if (status === 'On Time' || status === 'Late') {
+            checkInTime = timeStr;
+            finalStatus = status;
+        } else if (status === 'Absent') {
+            checkInTime = '--';
+            checkOutTime = '--';
+            finalStatus = 'Absent';
         }
 
         const attendanceData = {
@@ -2128,12 +2171,13 @@ app.post('/api/admin/office-attendance', async (req, res) => {
             role: emp.role,
             date: todayStr,
             checkInTime,
-            status,
-            reason: reason || '',
+            checkOutTime,
+            status: finalStatus,
+            reason: reason || existingData.reason || '',
             updatedAt: new Date().toISOString()
         };
 
-        await db.collection('office_attendance').doc(attendanceData.id).set(attendanceData, { merge: true });
+        await docRef.set(attendanceData, { merge: true });
         res.json({ success: true, message: 'Attendance recorded successfully', data: attendanceData });
     } catch (err) {
         console.error('Office Attendance Record Error:', err);
