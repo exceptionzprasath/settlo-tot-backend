@@ -2873,6 +2873,38 @@ app.get('/api/config/app-version', (req, res) => {
     });
 });
 
+// Get App Announcement Configuration
+app.get('/api/config/announcement', async (req, res) => {
+    try {
+        const doc = await db.collection('settings').doc('app_announcement').get();
+        if (doc.exists) {
+            res.json({ success: true, data: doc.data() });
+        } else {
+            res.json({ success: true, data: { content: '', active: false } });
+        }
+    } catch (err) {
+        console.error('Get Announcement Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to fetch announcement config' });
+    }
+});
+
+// Update App Announcement Configuration
+app.post('/api/config/announcement', async (req, res) => {
+    try {
+        const { content, active } = req.body;
+        const data = {
+            content: content || '',
+            active: !!active,
+            updatedAt: new Date().toISOString()
+        };
+        await db.collection('settings').doc('app_announcement').set(data);
+        res.json({ success: true, message: 'Announcement updated successfully', data });
+    } catch (err) {
+        console.error('Update Announcement Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to update announcement config' });
+    }
+});
+
 // Get all nearby vehicles
 app.get('/api/vehicles', (req, res) => {
     const { lat, lng, type } = req.query;
