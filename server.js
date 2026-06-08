@@ -1299,6 +1299,16 @@ app.post('/api/auth/verify-otp', async (req, res) => {
         // Clean up OTP on success
         delete otpStore[phone];
 
+        // Update user to be verified in DynamoDB
+        await ddbDocClient.send(new UpdateCommand({
+            TableName: tableName,
+            Key: { phone },
+            UpdateExpression: 'set isVerified = :verified',
+            ExpressionAttributeValues: {
+                ':verified': true
+            }
+        }));
+
         // Fetch the user from DynamoDB
         const result = await ddbDocClient.send(new GetCommand({
             TableName: tableName,
@@ -1333,6 +1343,16 @@ app.post('/api/auth/verify-firebase-token', async (req, res) => {
             const decodedToken = await admin.auth().verifyIdToken(idToken);
             verifiedPhone = decodedToken.phone_number || phone;
         }
+
+        // Update user to be verified in DynamoDB
+        await ddbDocClient.send(new UpdateCommand({
+            TableName: tableName,
+            Key: { phone: verifiedPhone },
+            UpdateExpression: 'set isVerified = :verified',
+            ExpressionAttributeValues: {
+                ':verified': true
+            }
+        }));
 
         // Fetch the user from DynamoDB
         const result = await ddbDocClient.send(new GetCommand({
@@ -1405,6 +1425,7 @@ app.post('/api/auth/register', upload.fields([
             licenseUrl: (files && files.license) ? files.license[0].location : null,
             familyAadharUrl: (files && files.familyAadhar) ? files.familyAadhar[0].location : null,
             createdAt: new Date().toISOString(),
+            isVerified: false,
             status: role === 'employee' ? 'pending_verification' : 'active'
         };
 
