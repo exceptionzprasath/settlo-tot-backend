@@ -341,7 +341,9 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-const { ddbDocClient, tableName } = require('./config/awsConfig');
+const { ddbDocClient, tableName, snsClient } = require('./config/awsConfig');
+const { PublishCommand } = require('@aws-sdk/client-sns');
+const otpStore = {}; // In-memory store for AWS SNS OTP codes
 const { initFirebase, getFirebaseAdmin } = require('./config/firebaseAdmin');
 const { runSetup } = require('./scripts/setupAws');
 const admin = require('firebase-admin');
@@ -1236,6 +1238,82 @@ app.post('/api/auth/check-phone', async (req, res) => {
     } catch (err) {
         console.error('Check Phone Error:', err);
         res.status(500).json({ success: false, message: 'Server error check-phone' });
+    }
+});
+
+// --- AWS SNS OTP Flows ---
+
+// Send OTP via AWS SNS
+app.post('/api/auth/send-otp', async (req, res) => {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ success: false, message: 'Phone number is required' });
+
+    try {
+        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        
+        // Store in-memory with 5 minutes expiration
+        otpStore[phone] = {
+            otp,
+            expiresAt: Date.now() + 5 * 60 * 1000
+        };
+
+        const message = `Your Thambioru Tea verification code is: ${otp}. Valid for 5 minutes.`;
+
+        console.log(`💬 [SNS] Sending OTP code ${otp} to ${phone}...`);
+        
+        const command = new PublishCommand({
+            Message: message,
+            PhoneNumber: phone,
+        });
+
+        await snsClient.send(command);
+
+        console.log(`💬 [SNS] OTP SMS sent successfully to ${phone}`);
+        res.json({ success: true, message: 'OTP sent successfully' });
+    } catch (err) {
+        console.error('Send OTP via SNS Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to send OTP via SMS. Please check your phone format.' });
+    }
+});
+
+// Verify OTP
+app.post('/api/auth/verify-otp', async (req, res) => {
+    const { phone, otp } = req.body;
+    if (!phone || !otp) return res.status(400).json({ success: false, message: 'Phone and OTP are required' });
+
+    try {
+        const storedData = otpStore[phone];
+        if (!storedData) {
+            return res.status(400).json({ success: false, message: 'OTP not requested or expired.' });
+        }
+
+        if (Date.now() > storedData.expiresAt) {
+            delete otpStore[phone];
+            return res.status(400).json({ success: false, message: 'OTP has expired. Please request a new one.' });
+        }
+
+        if (storedData.otp !== otp) {
+            return res.status(400).json({ success: false, message: 'Invalid verification code. Please check and try again.' });
+        }
+
+        // Clean up OTP on success
+        delete otpStore[phone];
+
+        // Fetch the user from DynamoDB
+        const result = await ddbDocClient.send(new GetCommand({
+            TableName: tableName,
+            Key: { phone }
+        }));
+
+        res.json({
+            success: true,
+            message: 'Phone verified successfully',
+            token: 'sns-verified-token-' + Math.floor(100000 + Math.random() * 900000),
+            user: result.Item || null
+        });
+    } catch (err) {
+        console.error('Verify OTP Error:', err);
+        res.status(500).json({ success: false, message: 'OTP verification failed' });
     }
 });
 
