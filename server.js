@@ -1238,6 +1238,16 @@ app.get('/api/orders/customer/:phone/free-tea-eligibility', async (req, res) => 
 const { GetCommand, PutCommand, ScanCommand, UpdateCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
 const upload = require('./middleware/upload');
 
+// Caching variables for active employees ScanCommand
+let activeEmployeesCache = null;
+let activeEmployeesCacheTime = 0;
+const ACTIVE_EMPLOYEES_CACHE_TTL = 10000; // 10 seconds in ms
+
+function clearActiveEmployeesCache() {
+    activeEmployeesCache = null;
+    activeEmployeesCacheTime = 0;
+}
+
 // --- Auth Routes ---
 
 // Check if user exists
@@ -1546,6 +1556,8 @@ app.put('/api/admin/employees/:phone', upload.fields([
             TableName: tableName,
             Item: updatedUserData
         }));
+
+        clearActiveEmployeesCache();
 
         res.json({ success: true, message: 'Employee details and documents updated successfully', user: updatedUserData });
     } catch (err) {
@@ -1936,28 +1948,102 @@ app.get('/api/employee/stats/:empId', async (req, res) => {
 
 // --- Admin Routes ---
 
-// Get all orders (for admin panel)
+// Get all orders (for admin panel, with pagination and filtering)
 app.get('/api/admin/orders', async (req, res) => {
     try {
-        const snapshot = await ordersCol.orderBy('createdAt', 'desc').limit(200).get();
-        const orders = snapshot.docs.map(doc => doc.data());
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 30;
+        const statusFilter = req.query.status || '';
+        const paymentFilter = req.query.paymentMode || '';
+        const startDate = req.query.startDate || '';
+        const endDate = req.query.endDate || '';
+        const search = (req.query.search || '').toLowerCase();
 
-        // Compute summary stats
-        const totalOrders = orders.filter(o => o.status !== 'pending_payment').length;
-        const activeOrders = orders.filter(o => ['placed', 'accepted', 'preparing', 'on_the_way', 'confirmed'].includes(o.status)).length;
-        const totalRevenue = orders
+        // Fetch all orders from Firestore sorted by createdAt desc
+        const snapshot = await ordersCol.orderBy('createdAt', 'desc').get();
+        const allOrders = snapshot.docs.map(doc => doc.data());
+
+        // Compute base non-pending orders
+        const nonPendingOrders = allOrders.filter(o => o.status !== 'pending_payment');
+
+        // Filter orders based on query parameters
+        let filteredOrders = nonPendingOrders;
+
+        // 1. Status Filter
+        if (statusFilter) {
+            filteredOrders = filteredOrders.filter(o => o.status === statusFilter);
+        }
+
+        // 2. Payment Mode Filter
+        if (paymentFilter) {
+            filteredOrders = filteredOrders.filter(o => {
+                const mode = (o.paymentMode || '').toLowerCase();
+                const filter = paymentFilter.toLowerCase();
+                if (filter === 'online') return mode === 'online' || mode === 'upi';
+                if (filter === 'cod') return mode === 'cod' || mode === 'cash';
+                return mode === filter;
+            });
+        }
+
+        // 3. Date range filter in IST
+        if (startDate || endDate) {
+            const getISTDateString = (dateInput) => {
+                if (!dateInput) return '';
+                try {
+                    const d = new Date(dateInput);
+                    if (isNaN(d.getTime())) return '';
+                    const formatter = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' });
+                    return formatter.format(d);
+                } catch (e) {
+                    return '';
+                }
+            };
+
+            filteredOrders = filteredOrders.filter(o => {
+                const istDate = getISTDateString(o.createdAt);
+                if (!istDate) return false;
+                if (startDate && istDate < startDate) return false;
+                if (endDate && istDate > endDate) return false;
+                return true;
+            });
+        }
+
+        // 4. Search Filter
+        if (search) {
+            filteredOrders = filteredOrders.filter(o => {
+                return (o.id || '').toLowerCase().includes(search) ||
+                       (o.customerName || '').toLowerCase().includes(search) ||
+                       (o.customerPhone || '').includes(search) ||
+                       (o.employeeName || '').toLowerCase().includes(search) ||
+                       (o.employeePhone || '').includes(search);
+            });
+        }
+
+        // Compute summary stats over the filtered subset of orders
+        const totalOrders = filteredOrders.length;
+        const activeOrders = filteredOrders.filter(o => ['placed', 'accepted', 'preparing', 'on_the_way', 'confirmed'].includes(o.status)).length;
+        const totalRevenue = filteredOrders
             .filter(o => o.status === 'delivered')
             .reduce((sum, o) => sum + (parseFloat(o.totalAmount) || 0), 0);
 
+        // Paginated slice
+        const totalFiltered = filteredOrders.length;
+        const totalPages = Math.ceil(totalFiltered / limit);
+        const startIndex = (page - 1) * limit;
+        const paginatedOrders = filteredOrders.slice(startIndex, startIndex + limit);
+
         res.json({
             success: true,
-            count: orders.length,
+            page,
+            limit,
+            totalFiltered,
+            totalPages,
             summary: {
                 totalOrders,
                 activeOrders,
                 totalRevenue: Math.round(totalRevenue)
             },
-            data: orders
+            data: paginatedOrders
         });
     } catch (err) {
         console.error('Fetch Admin Orders Error:', err);
@@ -2490,6 +2576,11 @@ app.post('/api/admin/office-attendance/biometric', upload.fields([
 // Get active and suspended employees
 app.get('/api/admin/employees/active', async (req, res) => {
     try {
+        const now = Date.now();
+        if (activeEmployeesCache && (now - activeEmployeesCacheTime < ACTIVE_EMPLOYEES_CACHE_TTL)) {
+            return res.json({ success: true, count: activeEmployeesCache.length, data: activeEmployeesCache });
+        }
+
         const result = await ddbDocClient.send(new ScanCommand({
             TableName: tableName,
             FilterExpression: '#role = :role AND (#status = :status OR #status = :suspendedStatus)',
@@ -2504,7 +2595,11 @@ app.get('/api/admin/employees/active', async (req, res) => {
             }
         }));
 
-        res.json({ success: true, count: result.Items ? result.Items.length : 0, data: result.Items || [] });
+        const items = result.Items || [];
+        activeEmployeesCache = items;
+        activeEmployeesCacheTime = Date.now();
+
+        res.json({ success: true, count: items.length, data: items });
     } catch (err) {
         console.error('Fetch Active Employees Error:', err);
         res.status(500).json({ success: false, message: 'Failed to fetch active employees' });
@@ -2548,6 +2643,52 @@ app.get('/api/admin/employees/:phone/history', async (req, res) => {
         const orders = Array.from(ordersMap.values()).sort((a, b) => {
             return new Date(b.createdAt) - new Date(a.createdAt);
         });
+
+        // 3. Reconcile with active/online rider session if they are currently online
+        let activeRider = null;
+        for (const [_, rider] of onlineRiders.entries()) {
+            if (rider.employeePhone === phone || (empId && rider.employeeId === empId)) {
+                activeRider = rider;
+                break;
+            }
+        }
+
+        if (!activeRider && empId) {
+            try {
+                const onlineDoc = await db.collection('online_riders').doc(empId).get();
+                if (onlineDoc.exists) {
+                    const rData = onlineDoc.data();
+                    if (rData.isOnline) {
+                        activeRider = rData;
+                    }
+                }
+            } catch (err) {
+                console.error('Error fetching online_riders document:', err);
+            }
+        }
+
+        if (activeRider) {
+            const todayStr = new Date().toISOString().split('T')[0];
+            if (!employee.workHistory) {
+                employee.workHistory = {};
+            }
+            const existingLog = employee.workHistory[todayStr] || {};
+            const startMs = existingLog.startMs || (activeRider.onlineSince ? new Date(activeRider.onlineSince).getTime() : Date.now());
+            const diffMs = Date.now() - startMs;
+            const diffHrs = Math.floor(diffMs / (1000 * 60 * 60));
+            const diffMins = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+
+            employee.workHistory[todayStr] = {
+                ...existingLog,
+                sales: Math.max(existingLog.sales || 0, activeRider.totalTeasSold || 0, activeRider.teasSold || 0),
+                duration: `${diffHrs}h ${diffMins}m`,
+                durationMs: diffMs,
+                canHistory: activeRider.canHistory || existingLog.canHistory || [],
+                onduty: existingLog.onduty || (activeRider.onlineSince ? new Date(activeRider.onlineSince).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '--'),
+                offline: '—',
+                startMs
+            };
+        }
 
         res.json({
             success: true,
@@ -2619,6 +2760,8 @@ app.post('/api/admin/applications/:phone/status', async (req, res) => {
 
         const result = await ddbDocClient.send(new UpdateCommand(updateParams));
 
+        clearActiveEmployeesCache();
+
         res.json({
             success: true,
             message: `Employee status updated to ${status}`,
@@ -2652,6 +2795,8 @@ app.post('/api/admin/employees/:phone/reset-pin', async (req, res) => {
         };
 
         await ddbDocClient.send(new UpdateCommand(updateParams));
+
+        clearActiveEmployeesCache();
 
         res.json({ success: true, message: 'PIN reset successfully' });
     } catch (err) {
@@ -2872,6 +3017,8 @@ app.delete('/api/admin/employees/:phone', async (req, res) => {
             TableName: tableName,
             Key: { phone }
         }));
+
+        clearActiveEmployeesCache();
 
         res.json({ success: true, message: 'Employee deleted successfully' });
     } catch (err) {
