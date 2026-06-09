@@ -1140,6 +1140,27 @@ app.post('/api/employees/:employeeId/offline-sale', async (req, res) => {
                 lastUpdated: new Date().toISOString()
             });
 
+            // Record the offline sale as a completed order in tot_orders for detailed tracking
+            const offlineOrderId = `OFF-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
+            const offlineOrderData = {
+                id: offlineOrderId,
+                status: 'delivered',
+                employeeId,
+                employeePhone: rData.employeePhone || '',
+                employeeName: rData.employeeName || '',
+                customerName: 'Offline Customer',
+                customerPhone: 'N/A',
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                totalAmount: cupsSold * 15,
+                paymentMode: paymentMode === 'upi' ? 'online' : 'cod',
+                paymentStatus: 'paid',
+                firstTeaFree: false,
+                isOfflineSale: true,
+                items: [{ name: 'Flask Tea (Offline)', quantity: cupsSold, price: 15 }]
+            };
+            await ordersCol.doc(offlineOrderId).set(offlineOrderData);
+
             // Update in-memory map so Socket.io admin broadcasts get the new inventory count instantly
             for (const [sId, activeRider] of onlineRiders.entries()) {
                 if (activeRider.employeeId === employeeId) {
@@ -2487,6 +2508,55 @@ app.get('/api/admin/employees/active', async (req, res) => {
     } catch (err) {
         console.error('Fetch Active Employees Error:', err);
         res.status(500).json({ success: false, message: 'Failed to fetch active employees' });
+    }
+});
+
+// Get detailed employee history (DynamoDB details + Firestore orders)
+app.get('/api/admin/employees/:phone/history', async (req, res) => {
+    try {
+        const { phone } = req.params;
+
+        // 1. Fetch employee from DynamoDB
+        const getParams = {
+            TableName: tableName,
+            Key: { phone }
+        };
+        const empResult = await ddbDocClient.send(new GetCommand(getParams));
+        if (!empResult.Item) {
+            return res.status(404).json({ success: false, message: 'Employee not found' });
+        }
+        const employee = empResult.Item;
+
+        // 2. Fetch all orders for this employee from Firestore tot_orders
+        const empId = employee.empId || '';
+        
+        const [ordersSnapshotByPhone, ordersSnapshotById] = await Promise.all([
+            ordersCol.where('employeePhone', '==', phone).get(),
+            empId ? ordersCol.where('employeeId', '==', empId).get() : Promise.resolve({ docs: [] })
+        ]);
+
+        const ordersMap = new Map();
+        ordersSnapshotByPhone.docs.forEach(doc => {
+            const data = doc.data();
+            ordersMap.set(data.id, data);
+        });
+        ordersSnapshotById.docs.forEach(doc => {
+            const data = doc.data();
+            ordersMap.set(data.id, data);
+        });
+
+        const orders = Array.from(ordersMap.values()).sort((a, b) => {
+            return new Date(b.createdAt) - new Date(a.createdAt);
+        });
+
+        res.json({
+            success: true,
+            employee,
+            orders
+        });
+    } catch (err) {
+        console.error('Fetch Employee History Error:', err);
+        res.status(500).json({ success: false, message: 'Failed to fetch employee history' });
     }
 });
 
