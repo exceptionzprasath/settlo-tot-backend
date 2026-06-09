@@ -401,6 +401,18 @@ app.post('/api/orders', async (req, res) => {
         const isEligibleForFreeTea = !hasReceivedFreeTea;
 
         let items = req.body.items || [];
+        const isBulk = req.body.isBulk === true;
+        if (isBulk) {
+            const bulkItem = items.find(item => item.id === 'item_002' || (item.name || '').toLowerCase().includes('bulk'));
+            const bulkQuantity = bulkItem ? bulkItem.quantity : 0;
+            if (bulkQuantity < 50) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Minimum bulk order quantity is 50 teas.'
+                });
+            }
+        }
+
         let firstTeaFree = false;
         let finalTotalAmount = parseFloat(req.body.totalAmount) || 0;
 
@@ -421,7 +433,6 @@ app.post('/api/orders', async (req, res) => {
         const hasFlaskTea = items.some(item => 
             (item.name || '').toLowerCase().includes('flask tea')
         );
-        const isBulk = req.body.isBulk === true;
         const isFlaskOrBulk = hasFlaskTea || isBulk;
 
         // Direct order placement (no Razorpay payment) for Cash on Delivery (COD) OR Promotional FREE orders (₹0 total)
