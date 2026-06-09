@@ -1955,6 +1955,7 @@ app.get('/api/admin/orders', async (req, res) => {
         const limit = parseInt(req.query.limit) || 30;
         const statusFilter = req.query.status || '';
         const paymentFilter = req.query.paymentMode || '';
+        const employeePhoneFilter = req.query.employeePhone || '';
         const startDate = req.query.startDate || '';
         const endDate = req.query.endDate || '';
         const search = (req.query.search || '').toLowerCase();
@@ -1985,7 +1986,12 @@ app.get('/api/admin/orders', async (req, res) => {
             });
         }
 
-        // 3. Date range filter in IST
+        // 3. Employee Filter
+        if (employeePhoneFilter) {
+            filteredOrders = filteredOrders.filter(o => (o.employeePhone || '') === employeePhoneFilter);
+        }
+
+        // 4. Date range filter in IST
         if (startDate || endDate) {
             const getISTDateString = (dateInput) => {
                 if (!dateInput) return '';
