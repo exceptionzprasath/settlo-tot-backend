@@ -398,21 +398,29 @@ app.post('/api/orders', async (req, res) => {
     try {
         const customerPhone = req.body.customerPhone;
         if (customerPhone) {
-            const activeOrdersSnapshot = await ordersCol
+            const ordersSnapshot = await ordersCol
                 .where('customerPhone', '==', customerPhone)
-                .where('status', '==', 'placed')
                 .get();
 
-            const activeOrder = activeOrdersSnapshot.docs.find(doc => {
+            const activeOrder = ordersSnapshot.docs.find(doc => {
                 const data = doc.data();
-                const elapsed = Date.now() - new Date(data.createdAt).getTime();
-                return elapsed < 300000; // 5 minutes
+                if (data.status === 'confirmed') {
+                    return true; // Blocked indefinitely until delivered/cancelled
+                }
+                if (data.status === 'placed') {
+                    const elapsed = Date.now() - new Date(data.createdAt).getTime();
+                    return elapsed < 300000; // 5 minutes block
+                }
+                return false;
             });
 
             if (activeOrder) {
+                const isConfirmed = activeOrder.data().status === 'confirmed';
                 return res.status(400).json({
                     success: false,
-                    message: 'You already have an active order waiting for rider confirmation. Please wait for a rider to accept it or for the current order to expire (5 mins) before placing another one.'
+                    message: isConfirmed
+                        ? 'You already have an order accepted and being delivered by a rider. Please wait until it is delivered before placing another one.'
+                        : 'You already have an active order waiting for rider confirmation. Please wait for a rider to accept it or for the current order to expire (5 mins) before placing another one.'
                 });
             }
         }
@@ -452,9 +460,12 @@ app.post('/api/orders', async (req, res) => {
             }
         }
 
-        // Check if user is eligible for First Tea Free promo (if they haven't received it in any successfully placed order yet)
+        // Check if user is eligible for First Tea Free promo (if they haven't received it in any successfully delivered or currently active order yet)
         const ordersSnapshot = await ordersCol.where('customerPhone', '==', req.body.customerPhone).get();
-        const validOrders = ordersSnapshot.docs.filter(doc => doc.data().status !== 'pending_payment');
+        const validOrders = ordersSnapshot.docs.filter(doc => {
+            const status = doc.data().status;
+            return status === 'delivered' || status === 'placed' || status === 'confirmed';
+        });
         const hasReceivedFreeTea = validOrders.some(doc => doc.data().firstTeaFree === true);
         const isEligibleForFreeTea = !hasReceivedFreeTea;
 
@@ -1317,10 +1328,10 @@ app.get('/api/orders/customer/:phone/free-tea-eligibility', async (req, res) => 
         const { phone } = req.params;
         const snapshot = await ordersCol.where('customerPhone', '==', phone).get();
         
-        // Check if there are any successfully placed/processed orders
+        // Check if there are any successfully delivered or currently active orders
         const validOrders = snapshot.docs.filter(doc => {
             const data = doc.data();
-            return data.status !== 'pending_payment';
+            return data.status === 'delivered' || data.status === 'placed' || data.status === 'confirmed';
         });
         
         const hasReceivedFreeTea = validOrders.some(doc => doc.data().firstTeaFree === true);
@@ -1373,7 +1384,7 @@ app.post('/api/auth/check-phone', async (req, res) => {
 
 // Send OTP via AWS SNS
 app.post('/api/auth/send-otp', async (req, res) => {
-    const { phone } = req.body;
+    const { phone, appSignature } = req.body;
     if (!phone) return res.status(400).json({ success: false, message: 'Phone number is required' });
 
     try {
@@ -1385,9 +1396,11 @@ app.post('/api/auth/send-otp', async (req, res) => {
             expiresAt: Date.now() + 5 * 60 * 1000
         };
 
-        const message = `Your Thambioru Tea verification code is: ${otp}. Valid for 5 minutes.`;
+        const message = appSignature 
+            ? `<#> Your Thambioru Tea verification code is: ${otp}. Valid for 5 minutes.\n${appSignature}`
+            : `Your Thambioru Tea verification code is: ${otp}. Valid for 5 minutes.`;
 
-        console.log(`💬 [SNS] Sending OTP code ${otp} to ${phone}...`);
+        console.log(`💬 [SNS] Sending OTP code ${otp} to ${phone} (App Signature: ${appSignature || 'none'})...`);
         
         const command = new PublishCommand({
             Message: message,
