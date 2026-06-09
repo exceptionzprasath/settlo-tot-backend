@@ -173,6 +173,43 @@ async function dispatchToNearbyRiders(orderData) {
     }
 }
 
+// Helper: Send a push notification to a specific customer by phone number topic
+async function sendCustomerPushNotification(phone, title, body) {
+    if (!phone) return;
+    try {
+        const sanitizedPhone = phone.replace(/[^a-zA-Z0-9-_.~%]/g, '');
+        const topicName = `customer_${sanitizedPhone}`;
+        
+        const message = {
+            notification: {
+                title,
+                body
+            },
+            topic: topicName,
+            android: {
+                priority: 'high',
+                notification: {
+                    sound: 'default',
+                    channelId: 'default_notification_channel',
+                    priority: 'max',
+                    defaultSound: true,
+                    defaultVibrateTimings: true,
+                }
+            },
+            data: {
+                type: 'order_status',
+                title,
+                body
+            }
+        };
+
+        const response = await admin.messaging().send(message);
+        console.log(`📲 [Push Notification] Sent status push to customer ${phone} (Topic: ${topicName}):`, response.messageId || response);
+    } catch (err) {
+        console.error(`❌ [Push Notification] Failed to send push to customer ${phone}:`, err.message);
+    }
+}
+
 app.use((req, res, next) => {
     req.io = io;
     next();
@@ -359,6 +396,27 @@ const crypto = require('crypto');
 // Create new order - saves to Firestore as pending_payment + generates Razorpay Order
 app.post('/api/orders', async (req, res) => {
     try {
+        const customerPhone = req.body.customerPhone;
+        if (customerPhone) {
+            const activeOrdersSnapshot = await ordersCol
+                .where('customerPhone', '==', customerPhone)
+                .where('status', '==', 'placed')
+                .get();
+
+            const activeOrder = activeOrdersSnapshot.docs.find(doc => {
+                const data = doc.data();
+                const elapsed = Date.now() - new Date(data.createdAt).getTime();
+                return elapsed < 300000; // 5 minutes
+            });
+
+            if (activeOrder) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'You already have an active order waiting for rider confirmation. Please wait for a rider to accept it or for the current order to expire (5 mins) before placing another one.'
+                });
+            }
+        }
+
         const orderId = req.body.id || ('ORD' + Math.floor(100000 + Math.random() * 900000));
 
         // Handle coordinate mapping if client sends locationCoords/deliveryAddress instead of customerLocation
@@ -483,6 +541,13 @@ app.post('/api/orders', async (req, res) => {
                                     status: 'expired'
                                 });
                                 io.to('admin').emit('order_update', { orderId, status: 'expired' });
+                                
+                                // Send FCM push alert to customer
+                                sendCustomerPushNotification(
+                                    currentOrder.customerPhone,
+                                    'Order Cancelled 🍵',
+                                    'Corporate manager did not approve within 5 minutes. It has been cancelled. You can now place a new order.'
+                                );
                             } else {
                                 await orderRef.update({
                                     status: 'unassigned',
@@ -494,6 +559,13 @@ app.post('/api/orders', async (req, res) => {
                                     status: 'unassigned'
                                 });
                                 io.to('riders').emit('order_expired', { orderId });
+
+                                // Send FCM push alert to customer
+                                sendCustomerPushNotification(
+                                    currentOrder.customerPhone,
+                                    'Order Cancelled ☕',
+                                    'No rider accepted your order. It has been cancelled. You can now place a new order.'
+                                );
                             }
                         }
                     }
@@ -672,6 +744,13 @@ app.get('/api/payments/verify', async (req, res) => {
                                 });
                                 io.to('admin').emit('order_update', { orderId, status: 'expired' });
 
+                                // Send FCM push alert to customer
+                                sendCustomerPushNotification(
+                                    currentOrder.customerPhone,
+                                    'Order Cancelled 🍵',
+                                    'Corporate manager did not approve within 5 minutes. A refund has been initiated and will be credited to your payment method within 2-3 business days. You can now place a new order.'
+                                );
+
                                 // Trigger automatic Razorpay Refund
                                 if (currentOrder.paymentMode === 'online' && currentOrder.paymentStatus === 'paid' && currentOrder.razorpayPaymentId) {
                                     try {
@@ -727,6 +806,13 @@ app.get('/api/payments/verify', async (req, res) => {
                                     status: 'unassigned'
                                 });
                                 io.to('riders').emit('order_expired', { orderId });
+
+                                // Send FCM push alert to customer
+                                sendCustomerPushNotification(
+                                    currentOrder.customerPhone,
+                                    'Order Cancelled ☕',
+                                    'No rider accepted your order. A refund has been initiated and will be credited to your payment method within 2-3 business days. You can now place a new order.'
+                                );
 
                                 // Trigger automatic Razorpay Refund
                                 if (currentOrder.paymentMode === 'online' && currentOrder.paymentStatus === 'paid' && currentOrder.razorpayPaymentId) {
