@@ -1305,8 +1305,8 @@ app.post('/api/employees/:employeeId/offline-sale', async (req, res) => {
 
 // Get orders for a specific customer
 app.get('/api/orders/customer/:phone', async (req, res) => {
+    const { phone } = req.params;
     try {
-        const { phone } = req.params;
         const snapshot = await ordersCol.where('customerPhone', '==', phone).orderBy('createdAt', 'desc').get();
         const orders = snapshot.docs.map(doc => doc.data());
         res.json({ success: true, data: orders });
