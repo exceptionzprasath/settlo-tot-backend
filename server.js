@@ -1370,7 +1370,7 @@ app.post('/api/auth/check-phone', async (req, res) => {
         }));
 
         if (result.Item) {
-            return res.json({ success: true, exists: true, message: 'User exists' });
+            return res.json({ success: true, exists: true, user: result.Item, message: 'User exists' });
         } else {
             return res.json({ success: true, exists: false, message: 'User not found' });
         }
