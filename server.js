@@ -1356,6 +1356,18 @@ function clearActiveEmployeesCache() {
     activeEmployeesCacheTime = 0;
 }
 
+// Caching variables for admin users ScanCommand
+let adminUsersCache = null;
+let adminUsersCacheTime = 0;
+let adminUsersFetchPromise = null;
+const ADMIN_USERS_CACHE_TTL = 300000; // 5 minutes in ms
+
+function clearAdminUsersCache() {
+    adminUsersCache = null;
+    adminUsersCacheTime = 0;
+    adminUsersFetchPromise = null;
+}
+
 // --- Auth Routes ---
 
 // Check if user exists
@@ -1575,6 +1587,8 @@ app.post('/api/auth/register', upload.fields([
             Item: userData
         }));
 
+        clearAdminUsersCache();
+
         res.json({ success: true, message: 'Registration successful', user: userData });
     } catch (err) {
         console.error('Registration Error:', err);
@@ -1748,6 +1762,8 @@ app.patch('/api/auth/profile', async (req, res) => {
         };
 
         const result = await ddbDocClient.send(new UpdateCommand(updateParams));
+
+        clearAdminUsersCache();
 
         res.json({
             success: true,
@@ -2239,21 +2255,59 @@ app.get('/api/admin/orders/analytics-data', async (req, res) => {
     }
 });
 
-// Get all users (customers)
+// Get all users (customers) with pagination support to bypass the 1MB DynamoDB limit
 app.get('/api/admin/users', async (req, res) => {
     try {
-        const result = await ddbDocClient.send(new ScanCommand({
-            TableName: tableName,
-            FilterExpression: '#role = :role',
-            ExpressionAttributeNames: {
-                '#role': 'role'
-            },
-            ExpressionAttributeValues: {
-                ':role': 'customer'
-            }
-        }));
+        const now = Date.now();
+        if (adminUsersCache && (now - adminUsersCacheTime < ADMIN_USERS_CACHE_TTL)) {
+            return res.json({ success: true, count: adminUsersCache.length, data: adminUsersCache });
+        }
 
-        res.json({ success: true, count: result.Items ? result.Items.length : 0, data: result.Items || [] });
+        if (!adminUsersFetchPromise) {
+            adminUsersFetchPromise = (async () => {
+                try {
+                    let allItems = [];
+                    let lastEvaluatedKey = undefined;
+
+                    do {
+                        const params = {
+                            TableName: tableName,
+                            FilterExpression: '#role = :role',
+                            ExpressionAttributeNames: {
+                                '#role': 'role'
+                            },
+                            ExpressionAttributeValues: {
+                                ':role': 'customer'
+                            }
+                        };
+
+                        if (lastEvaluatedKey) {
+                            params.ExclusiveStartKey = lastEvaluatedKey;
+                        }
+
+                        const result = await ddbDocClient.send(new ScanCommand(params));
+                        if (result.Items) {
+                            allItems = allItems.concat(result.Items);
+                        }
+                        lastEvaluatedKey = result.LastEvaluatedKey;
+
+                        if (lastEvaluatedKey) {
+                            // Delay 150ms between pages to respect low provisioned RCUs (5 RCUs)
+                            await new Promise(resolve => setTimeout(resolve, 150));
+                        }
+                    } while (lastEvaluatedKey);
+
+                    adminUsersCache = allItems;
+                    adminUsersCacheTime = Date.now();
+                    return allItems;
+                } finally {
+                    adminUsersFetchPromise = null;
+                }
+            })();
+        }
+
+        const data = await adminUsersFetchPromise;
+        res.json({ success: true, count: data.length, data: data });
     } catch (err) {
         console.error('Fetch Users Error:', err);
         res.status(500).json({ success: false, message: 'Failed to fetch users' });
