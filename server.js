@@ -2072,6 +2072,74 @@ app.get('/api/employee/stats/:empId', async (req, res) => {
     }
 });
 
+// --- Dispatch Operations Manual entry endpoints ---
+
+// Get all manual dispatch entries
+app.get('/api/admin/dispatches', async (req, res) => {
+    try {
+        const dispatchesCol = db.collection('tot_dispatches');
+        const snapshot = await dispatchesCol.orderBy('createdAt', 'desc').get();
+        const dispatches = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        res.json({ success: true, data: dispatches });
+    } catch (err) {
+        console.error('Fetch Dispatches Error:', err);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+// Create a new dispatch entry
+app.post('/api/admin/dispatches', async (req, res) => {
+    try {
+        const dispatchData = {
+            lot: req.body.lot || '1',
+            riderName: req.body.riderName || '',
+            riderPhone: req.body.riderPhone || '',
+            outTime: req.body.outTime || '',
+            inTime: req.body.inTime || '',
+            litersCount: req.body.litersCount || '',
+            cupsOut: req.body.cupsOut || '',
+            cupsIn: req.body.cupsIn || '',
+            paymentOnline: req.body.paymentOnline || '',
+            paymentCash: req.body.paymentCash || '',
+            free: req.body.free || '',
+            pending: req.body.pending || '',
+            totalPayment: req.body.totalPayment || '',
+            progress: req.body.progress || 'Not Completed',
+            createdAt: new Date().toISOString()
+        };
+        const dispatchesCol = db.collection('tot_dispatches');
+        const docRef = await dispatchesCol.add(dispatchData);
+        res.json({ success: true, data: { id: docRef.id, ...dispatchData } });
+    } catch (err) {
+        console.error('Create Dispatch Error:', err);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+// Update a dispatch entry (e.g. toggle progress or edit fields)
+app.patch('/api/admin/dispatches/:id', async (req, res) => {
+    try {
+        const dispatchesCol = db.collection('tot_dispatches');
+        await dispatchesCol.doc(req.params.id).update(req.body);
+        res.json({ success: true, message: 'Dispatch updated successfully' });
+    } catch (err) {
+        console.error('Update Dispatch Error:', err);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+// Delete a dispatch entry
+app.delete('/api/admin/dispatches/:id', async (req, res) => {
+    try {
+        const dispatchesCol = db.collection('tot_dispatches');
+        await dispatchesCol.doc(req.params.id).delete();
+        res.json({ success: true, message: 'Dispatch deleted successfully' });
+    } catch (err) {
+        console.error('Delete Dispatch Error:', err);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
 // --- Admin Routes ---
 
 // Get all orders (for admin panel, with pagination and filtering)
