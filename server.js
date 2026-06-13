@@ -2106,8 +2106,20 @@ app.get('/api/admin/orders', async (req, res) => {
             filteredOrders = filteredOrders.filter(o => {
                 const mode = (o.paymentMode || '').toLowerCase();
                 const filter = paymentFilter.toLowerCase();
-                if (filter === 'online') return mode === 'online' || mode === 'upi';
-                if (filter === 'cod') return mode === 'cod' || mode === 'cash';
+                const isOffline = !!o.isOfflineSale;
+                
+                if (filter === 'cod') {
+                    return !isOffline && (mode === 'cod' || mode === 'cash');
+                }
+                if (filter === 'cash') {
+                    return isOffline && (mode === 'cod' || mode === 'cash');
+                }
+                if (filter === 'qr') {
+                    return isOffline && (mode === 'online' || mode === 'upi');
+                }
+                if (filter === 'online') {
+                    return !isOffline && (mode === 'online' || mode === 'upi');
+                }
                 return mode === filter;
             });
         }
