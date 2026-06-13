@@ -2153,6 +2153,7 @@ app.get('/api/admin/orders', async (req, res) => {
         const startDate = req.query.startDate || '';
         const endDate = req.query.endDate || '';
         const search = (req.query.search || '').toLowerCase();
+        const isCorporate = req.query.isCorporate === 'true';
 
         // Fetch all orders from Firestore sorted by createdAt desc
         const snapshot = await ordersCol.orderBy('createdAt', 'desc').get();
@@ -2163,6 +2164,15 @@ app.get('/api/admin/orders', async (req, res) => {
 
         // Filter orders based on query parameters
         let filteredOrders = nonPendingOrders;
+
+        // Apply Corporate filter (bulk and flask tea orders)
+        if (isCorporate) {
+            filteredOrders = filteredOrders.filter(o => {
+                const isBulkType = o.isBulk === true || o.orderType === 'bulk';
+                const isFlaskType = o.orderType === 'flask_tea' || o.items?.some(item => (item.name || '').toLowerCase().includes('flask tea'));
+                return isBulkType || isFlaskType;
+            });
+        }
 
         // 1. Status Filter
         if (statusFilter) {
