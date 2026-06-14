@@ -393,6 +393,53 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
+// Timezone-aware IST Calendar Utilities for Spin & Win
+function getISTInfo(date = new Date()) {
+    const formatter = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'Asia/Kolkata',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false
+    });
+    const parts = formatter.formatToParts(date);
+    const partMap = {};
+    parts.forEach(p => { partMap[p.type] = p.value; });
+    
+    const year = parseInt(partMap.year, 10);
+    const month = parseInt(partMap.month, 10);
+    const day = parseInt(partMap.day, 10);
+    
+    const istDateObj = new Date(Date.UTC(year, month - 1, day));
+    const dayNum = istDateObj.getUTCDay(); // 0 is Sunday, 1 is Monday, etc.
+    const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    
+    // In our system, week starts on Monday, ends on Sunday
+    const daysSinceMonday = dayNum === 0 ? 6 : dayNum - 1;
+    const mondayDate = new Date(istDateObj.getTime() - daysSinceMonday * 24 * 60 * 60 * 1000);
+    
+    const mondayYear = mondayDate.getUTCFullYear();
+    const mondayMonth = String(mondayDate.getUTCMonth() + 1).padStart(2, '0');
+    const mondayDay = String(mondayDate.getUTCDate()).padStart(2, '0');
+    const weekIdentifier = `${mondayYear}-${mondayMonth}-${mondayDay}`;
+    
+    return {
+        year,
+        month,
+        day,
+        dayName: dayNames[dayNum],
+        dayNum,
+        weekIdentifier
+    };
+}
+
+function getWeekIdentifierOfDate(date) {
+    return getISTInfo(date).weekIdentifier;
+}
+
 // Create new order - saves to Firestore as pending_payment + generates Razorpay Order
 app.post('/api/orders', async (req, res) => {
     try {
@@ -460,14 +507,48 @@ app.post('/api/orders', async (req, res) => {
             }
         }
 
-        // Check if user is eligible for First Tea Free promo (if they haven't received it in any successfully delivered or currently active order yet)
-        const ordersSnapshot = await ordersCol.where('customerPhone', '==', req.body.customerPhone).get();
-        const validOrders = ordersSnapshot.docs.filter(doc => {
-            const status = doc.data().status;
-            return status === 'delivered' || status === 'placed' || status === 'confirmed';
-        });
-        const hasReceivedFreeTea = validOrders.some(doc => doc.data().firstTeaFree === true);
-        const isEligibleForFreeTea = !hasReceivedFreeTea;
+        // Check if user is eligible for First Tea Free promo or has an active Spin Free Tea
+        const phone = req.body.customerPhone;
+        let isEligibleForFreeTea = false;
+        let isSpinFreeTea = false;
+        let ordersSnapshot;
+        
+        if (phone) {
+            ordersSnapshot = await ordersCol.where('customerPhone', '==', phone).get();
+            const validOrders = ordersSnapshot.docs.filter(doc => {
+                const status = doc.data().status;
+                return status === 'delivered' || status === 'placed' || status === 'confirmed';
+            });
+            
+            // Check first tea eligibility (excluding spin-won free tea orders)
+            const hasReceivedFirstFreeTea = validOrders.some(doc => doc.data().firstTeaFree === true && !doc.data().spinFreeTea);
+            const isFirstTeaEligible = !hasReceivedFirstFreeTea;
+            
+            if (isFirstTeaEligible) {
+                isEligibleForFreeTea = true;
+            } else {
+                // Check spin free tea eligibility
+                const spinDoc = await db.collection('tot_spins').doc(phone).get();
+                if (spinDoc.exists) {
+                    const spinData = spinDoc.data();
+                    const ist = getISTInfo(new Date());
+                    
+                    if (spinData.currentWeek === ist.weekIdentifier && spinData.currentWeekWinDay) {
+                        const activeOrdersWithSpinTea = ordersSnapshot.docs.filter(doc => {
+                            const data = doc.data();
+                            const isActiveOrDelivered = data.status === 'delivered' || data.status === 'placed' || data.status === 'confirmed';
+                            const isThisWeek = getWeekIdentifierOfDate(new Date(data.createdAt)) === ist.weekIdentifier;
+                            return isActiveOrDelivered && isThisWeek && data.spinFreeTea === true;
+                        });
+                        
+                        if (activeOrdersWithSpinTea.length === 0) {
+                            isEligibleForFreeTea = true;
+                            isSpinFreeTea = true;
+                        }
+                    }
+                }
+            }
+        }
 
         let items = req.body.items || [];
         const isBulk = req.body.isBulk === true;
@@ -516,6 +597,7 @@ app.post('/api/orders', async (req, res) => {
                 paymentMode: isFreeOrder ? 'free' : (req.body.paymentMode || 'COD'),
                 paymentStatus: isFreeOrder ? 'paid' : (req.body.paymentStatus || 'pending'),
                 firstTeaFree,
+                spinFreeTea,
                 orderType: isFlaskOrBulk ? (isBulk ? 'bulk' : 'flask_tea') : 'normal',
                 isBulk: isBulk,
                 createdAt: new Date().toISOString(),
@@ -614,6 +696,7 @@ app.post('/api/orders', async (req, res) => {
             paymentMode: 'online',
             paymentStatus: 'pending',
             firstTeaFree,
+            spinFreeTea,
             razorpayOrderId: razorpayOrder.id,
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString()
@@ -1322,24 +1405,227 @@ app.get('/api/orders/customer/:phone', async (req, res) => {
         }
     }
 });
-// Check if a customer is eligible for "First Tea Free"
+// Check if a customer is eligible for "First Tea Free" or has a pending "Spin Free Tea" this week
 app.get('/api/orders/customer/:phone/free-tea-eligibility', async (req, res) => {
     try {
         const { phone } = req.params;
         const snapshot = await ordersCol.where('customerPhone', '==', phone).get();
-        
-        // Check if there are any successfully delivered or currently active orders
         const validOrders = snapshot.docs.filter(doc => {
             const data = doc.data();
             return data.status === 'delivered' || data.status === 'placed' || data.status === 'confirmed';
         });
         
-        const hasReceivedFreeTea = validOrders.some(doc => doc.data().firstTeaFree === true);
-        const isEligible = !hasReceivedFreeTea;
-        res.json({ success: true, eligible: isEligible });
+        // 1. First Tea Free
+        const hasReceivedFirstFreeTea = validOrders.some(doc => doc.data().firstTeaFree === true && !doc.data().spinFreeTea);
+        const isFirstTeaEligible = !hasReceivedFirstFreeTea;
+        
+        if (isFirstTeaEligible) {
+            return res.json({ success: true, eligible: true, type: 'first_tea' });
+        }
+        
+        // 2. Check Spin Free Tea
+        const spinDoc = await db.collection('tot_spins').doc(phone).get();
+        if (spinDoc.exists) {
+            const spinData = spinDoc.data();
+            const ist = getISTInfo(new Date());
+            
+            // Did they win this week?
+            if (spinData.currentWeek === ist.weekIdentifier && spinData.currentWeekWinDay) {
+                // Check if they have already placed an active/delivered order this week using the spin free tea
+                const activeOrdersWithSpinTea = snapshot.docs.filter(doc => {
+                    const data = doc.data();
+                    const isActiveOrDelivered = data.status === 'delivered' || data.status === 'placed' || data.status === 'confirmed';
+                    const isThisWeek = getWeekIdentifierOfDate(new Date(data.createdAt)) === ist.weekIdentifier;
+                    return isActiveOrDelivered && isThisWeek && data.spinFreeTea === true;
+                });
+                
+                if (activeOrdersWithSpinTea.length === 0) {
+                    return res.json({ success: true, eligible: true, type: 'spin_tea' });
+                }
+            }
+        }
+        
+        res.json({ success: true, eligible: false });
     } catch (err) {
         console.error('Free Tea Eligibility Error:', err);
         res.status(500).json({ success: false, message: 'Server error checking eligibility' });
+    }
+});
+
+// Spin & Win Endpoints
+
+// GET: Check spin status and cooldown for a user
+app.get('/api/spin/status/:phone', async (req, res) => {
+    try {
+        const { phone } = req.params;
+        const spinRef = db.collection('tot_spins').doc(phone);
+        const doc = await spinRef.get();
+        
+        const now = new Date();
+        const ist = getISTInfo(now);
+        
+        const isBypass = phone === '+919361016097' || phone === '9361016097';
+        const isSunday = ist.dayName === 'Sunday' && !isBypass;
+        
+        if (!doc.exists) {
+            return res.json({
+                success: true,
+                canSpin: isBypass || ist.dayName !== 'Sunday',
+                cooldownRemaining: 0,
+                hasPendingFreeTea: false,
+                isSunday: isSunday,
+                lastSpinTime: null
+            });
+        }
+        
+        const spinData = doc.data();
+        let canSpin = true;
+        let cooldownRemaining = 0;
+        
+        if (isSunday) {
+            canSpin = false;
+        } else if (spinData.lastSpinTime) {
+            const elapsed = now.getTime() - new Date(spinData.lastSpinTime).getTime();
+            if (elapsed < 24 * 60 * 60 * 1000) {
+                canSpin = false;
+                cooldownRemaining = 24 * 60 * 60 * 1000 - elapsed;
+            }
+        }
+        
+        // Determine if they currently hold an unused Free Tea reward from this week
+        let hasPendingFreeTea = false;
+        if (spinData.currentWeek === ist.weekIdentifier && spinData.currentWeekWinDay) {
+            // Check if they placed an order using it
+            const snapshot = await ordersCol.where('customerPhone', '==', phone).get();
+            const activeOrdersWithSpinTea = snapshot.docs.filter(doc => {
+                const data = doc.data();
+                const isActiveOrDelivered = data.status === 'delivered' || data.status === 'placed' || data.status === 'confirmed';
+                const isThisWeek = getWeekIdentifierOfDate(new Date(data.createdAt)) === ist.weekIdentifier;
+                return isActiveOrDelivered && isThisWeek && data.spinFreeTea === true;
+            });
+            hasPendingFreeTea = activeOrdersWithSpinTea.length === 0;
+        }
+        
+        res.json({
+            success: true,
+            canSpin,
+            cooldownRemaining,
+            hasPendingFreeTea,
+            isSunday: isSunday,
+            lastSpinTime: spinData.lastSpinTime
+        });
+    } catch (err) {
+        console.error('Fetch Spin Status Error:', err);
+        res.status(500).json({ success: false, message: 'Server error checking spin status' });
+    }
+});
+
+// POST: Spin the wheel
+app.post('/api/spin/:phone', async (req, res) => {
+    try {
+        const { phone } = req.params;
+        const now = new Date();
+        const ist = getISTInfo(now);
+        
+        const isBypass = phone === '+919361016097' || phone === '9361016097';
+        if (ist.dayName === 'Sunday' && !isBypass) {
+            return res.status(400).json({ success: false, message: 'Sunday is a holiday. Spins are not available today!' });
+        }
+        
+        const spinRef = db.collection('tot_spins').doc(phone);
+        const doc = await spinRef.get();
+        let spinData = doc.exists ? doc.data() : {
+            phone,
+            lastSpinTime: null,
+            history: [],
+            currentWeek: '',
+            currentWeekWinDay: null,
+            previousWeekWinDay: null
+        };
+        
+        // Check cooldown
+        if (spinData.lastSpinTime) {
+            const elapsed = now.getTime() - new Date(spinData.lastSpinTime).getTime();
+            if (elapsed < 24 * 60 * 60 * 1000) {
+                const remaining = 24 * 60 * 60 * 1000 - elapsed;
+                return res.status(400).json({
+                    success: false,
+                    message: 'Spin is on cooldown. Please wait.',
+                    cooldownRemaining: remaining
+                });
+            }
+        }
+        
+        // Handle weekly transition
+        if (spinData.currentWeek !== ist.weekIdentifier) {
+            spinData.previousWeekWinDay = spinData.currentWeekWinDay || null;
+            spinData.currentWeek = ist.weekIdentifier;
+            spinData.currentWeekWinDay = null;
+        }
+        
+        // Decide spin outcome
+        let result = 'better_luck';
+        const alreadyWonThisWeek = !!spinData.currentWeekWinDay;
+        
+        if (!alreadyWonThisWeek) {
+            const allDays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+            const validDays = allDays.filter(day => day !== spinData.previousWeekWinDay);
+            
+            if (validDays.includes(ist.dayName)) {
+                const currentDayIndexInAll = allDays.indexOf(ist.dayName);
+                const remainingValidDays = validDays.filter(day => allDays.indexOf(day) >= currentDayIndexInAll);
+                
+                if (remainingValidDays.length === 1) {
+                    // Today is the last possible winning day this week, must win!
+                    result = 'free_tea';
+                } else {
+                    // Random probability: 1 / number of remaining valid days
+                    const probability = 1 / remainingValidDays.length;
+                    const roll = Math.random();
+                    if (roll < probability) {
+                        result = 'free_tea';
+                    }
+                }
+            }
+        }
+        
+        // Select matching slot index: 3 Free Slots (0, 2, 4), 3 Try Again Slots (1, 3, 5)
+        let slotIndex = 0;
+        if (result === 'free_tea') {
+            const freeSlots = [0, 2, 4];
+            slotIndex = freeSlots[Math.floor(Math.random() * freeSlots.length)];
+            spinData.currentWeekWinDay = ist.dayName;
+        } else {
+            const betterLuckSlots = [1, 3, 5];
+            slotIndex = betterLuckSlots[Math.floor(Math.random() * betterLuckSlots.length)];
+        }
+        
+        // Log to history
+        const spinRecord = {
+            timestamp: now.toISOString(),
+            result,
+            dayOfWeek: ist.dayName,
+            weekIdentifier: ist.weekIdentifier,
+            slotIndex
+        };
+        
+        spinData.lastSpinTime = now.toISOString();
+        if (!spinData.history) spinData.history = [];
+        spinData.history.push(spinRecord);
+        
+        // Save back to Firestore
+        await spinRef.set(spinData);
+        
+        res.json({
+            success: true,
+            result,
+            slotIndex,
+            lastSpinTime: spinData.lastSpinTime,
+            cooldownRemaining: 24 * 60 * 60 * 1000
+        });
+    } catch (err) {
+        console.error('Execute Spin Error:', err);
+        res.status(500).json({ success: false, message: 'Server error executing spin' });
     }
 });
 
