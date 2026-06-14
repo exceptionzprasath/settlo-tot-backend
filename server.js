@@ -1464,16 +1464,13 @@ app.get('/api/spin/status/:phone', async (req, res) => {
         const now = new Date();
         const ist = getISTInfo(now);
         
-        const isBypass = phone === '+919361016097' || phone === '9361016097';
-        const isSunday = ist.dayName === 'Sunday' && !isBypass;
-        
         if (!doc.exists) {
             return res.json({
                 success: true,
-                canSpin: isBypass || ist.dayName !== 'Sunday',
+                canSpin: true,
                 cooldownRemaining: 0,
                 hasPendingFreeTea: false,
-                isSunday: isSunday,
+                isSunday: false,
                 lastSpinTime: null
             });
         }
@@ -1482,9 +1479,7 @@ app.get('/api/spin/status/:phone', async (req, res) => {
         let canSpin = true;
         let cooldownRemaining = 0;
         
-        if (isSunday) {
-            canSpin = false;
-        } else if (spinData.lastSpinTime) {
+        if (spinData.lastSpinTime) {
             const elapsed = now.getTime() - new Date(spinData.lastSpinTime).getTime();
             if (elapsed < 24 * 60 * 60 * 1000) {
                 canSpin = false;
@@ -1511,7 +1506,7 @@ app.get('/api/spin/status/:phone', async (req, res) => {
             canSpin,
             cooldownRemaining,
             hasPendingFreeTea,
-            isSunday: isSunday,
+            isSunday: false,
             lastSpinTime: spinData.lastSpinTime
         });
     } catch (err) {
@@ -1526,11 +1521,6 @@ app.post('/api/spin/:phone', async (req, res) => {
         const { phone } = req.params;
         const now = new Date();
         const ist = getISTInfo(now);
-        
-        const isBypass = phone === '+919361016097' || phone === '9361016097';
-        if (ist.dayName === 'Sunday' && !isBypass) {
-            return res.status(400).json({ success: false, message: 'Sunday is a holiday. Spins are not available today!' });
-        }
         
         const spinRef = db.collection('tot_spins').doc(phone);
         const doc = await spinRef.get();
