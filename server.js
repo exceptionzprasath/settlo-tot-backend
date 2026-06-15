@@ -597,7 +597,7 @@ app.post('/api/orders', async (req, res) => {
                 paymentMode: isFreeOrder ? 'free' : (req.body.paymentMode || 'COD'),
                 paymentStatus: isFreeOrder ? 'paid' : (req.body.paymentStatus || 'pending'),
                 firstTeaFree,
-                spinFreeTea,
+                spinFreeTea: isSpinFreeTea,
                 orderType: isFlaskOrBulk ? (isBulk ? 'bulk' : 'flask_tea') : 'normal',
                 isBulk: isBulk,
                 createdAt: new Date().toISOString(),
@@ -696,7 +696,7 @@ app.post('/api/orders', async (req, res) => {
             paymentMode: 'online',
             paymentStatus: 'pending',
             firstTeaFree,
-            spinFreeTea,
+            spinFreeTea: isSpinFreeTea,
             razorpayOrderId: razorpayOrder.id,
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString()
@@ -721,7 +721,7 @@ app.post('/api/orders', async (req, res) => {
         });
     } catch (err) {
         console.error('Create Order Error:', err);
-        res.status(500).json({ success: false, message: 'Failed to initiate payment & place order' });
+        res.status(500).json({ success: false, message: 'Failed to initiate payment & place order', error: err.message });
     }
 });
 
@@ -1390,19 +1390,12 @@ app.post('/api/employees/:employeeId/offline-sale', async (req, res) => {
 app.get('/api/orders/customer/:phone', async (req, res) => {
     const { phone } = req.params;
     try {
-        const snapshot = await ordersCol.where('customerPhone', '==', phone).orderBy('createdAt', 'desc').get();
-        const orders = snapshot.docs.map(doc => doc.data());
+        const snapshot = await ordersCol.where('customerPhone', '==', phone).get();
+        const orders = snapshot.docs.map(doc => doc.data()).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
         res.json({ success: true, data: orders });
     } catch (err) {
         console.error('Fetch Customer Orders Error:', err);
-        // Fallback without orderBy if index not ready
-        try {
-            const snapshot2 = await ordersCol.where('customerPhone', '==', phone).get();
-            const orders = snapshot2.docs.map(doc => doc.data()).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-            res.json({ success: true, data: orders });
-        } catch (err2) {
-            res.status(500).json({ success: false, message: 'Failed to fetch your orders' });
-        }
+        res.status(500).json({ success: false, message: 'Failed to fetch your orders' });
     }
 });
 // Check if a customer is eligible for "First Tea Free" or has a pending "Spin Free Tea" this week

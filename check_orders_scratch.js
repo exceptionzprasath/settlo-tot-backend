@@ -1,24 +1,20 @@
-const { ddbDocClient, tableName } = require('./config/awsConfig');
-const { GetCommand } = require('@aws-sdk/lib-dynamodb');
+const { initFirebase } = require('./config/firebaseAdmin');
+const db = initFirebase();
 
-async function checkEmployee() {
+async function run() {
     try {
-        const phone = '9361016097';
-        const getParams = {
-            TableName: tableName,
-            Key: { phone }
-        };
-        const empResult = await ddbDocClient.send(new GetCommand(getParams));
-        if (empResult.Item) {
-            console.log('Employee details:', JSON.stringify(empResult.Item, null, 2));
-        } else {
-            console.log(`Employee with phone ${phone} not found.`);
-        }
+        const snapshot = await db.collection('tot_orders').orderBy('createdAt', 'desc').limit(5).get();
+        console.log('Orders found:', snapshot.size);
+        snapshot.forEach(doc => {
+            const data = doc.data();
+            console.log(`Order #${doc.id}: status=${data.status}, paymentMethod=${data.paymentMethod}, paymentMode=${data.paymentMode}, totalAmount=${data.totalAmount}`);
+            console.log('JSON:', JSON.stringify(data, null, 2));
+            console.log('---');
+        });
         process.exit(0);
     } catch (err) {
         console.error(err);
         process.exit(1);
     }
 }
-
-checkEmployee();
+run();
