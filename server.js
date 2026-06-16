@@ -2361,6 +2361,7 @@ app.post('/api/admin/dispatches', async (req, res) => {
     try {
         const dispatchData = {
             lot: req.body.lot || '1',
+            date: req.body.date || new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }),
             riderName: req.body.riderName || '',
             riderPhone: req.body.riderPhone || '',
             outTime: req.body.outTime || '',
