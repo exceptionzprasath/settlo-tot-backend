@@ -1117,6 +1117,12 @@ app.post('/api/orders/:id/accept', async (req, res) => {
                 order: updatedOrder,
             });
             console.log(`📤 Notified customer ${updatedOrder.customerPhone}: order ${orderId} confirmed by ${employeeName}`);
+            
+            sendCustomerPushNotification(
+                updatedOrder.customerPhone,
+                'Order Accepted 🏍️',
+                `Your order #${orderId} has been accepted by ${employeeName}. They are on their way!`
+            );
         }
 
         res.json({ success: true, message: 'Order accepted', data: updatedOrder });
@@ -1165,8 +1171,34 @@ app.patch('/api/orders/:id/status', async (req, res) => {
         const { status } = req.body;
         const orderId = req.params.id;
 
-        if (status !== 'delivered') {
+        if (status !== 'delivered' && status !== 'cancelled') {
             return res.status(400).json({ success: false, message: 'Invalid status update' });
+        }
+
+        if (status === 'cancelled') {
+            await ordersCol.doc(orderId).update({
+                status: 'cancelled',
+                updatedAt: new Date().toISOString(),
+                cancelledAt: new Date().toISOString()
+            });
+
+            const updatedDoc = await ordersCol.doc(orderId).get();
+            const orderData = updatedDoc.data();
+
+            if (orderData && orderData.customerPhone) {
+                io.to(`customer_${orderData.customerPhone}`).emit('order_cancelled', {
+                    orderId,
+                    status: 'cancelled',
+                    message: 'Your order was cancelled by the delivery partner.'
+                });
+                sendCustomerPushNotification(
+                    orderData.customerPhone,
+                    'Order Cancelled ❌',
+                    `Your order #${orderId} was cancelled by the rider. You can now place a new order.`
+                );
+            }
+
+            return res.json({ success: true, message: 'Order cancelled', data: orderData });
         }
 
         const updateData = {
@@ -1181,6 +1213,14 @@ app.patch('/api/orders/:id/status', async (req, res) => {
 
         const updatedDoc = await ordersCol.doc(orderId).get();
         const orderData = updatedDoc.data();
+
+        if (orderData && orderData.customerPhone) {
+            sendCustomerPushNotification(
+                orderData.customerPhone,
+                'Order Delivered ☕',
+                `Your order #${orderId} was delivered successfully! Enjoy your fresh tea.`
+            );
+        }
 
         // ☕ Decrement employee remaining tea cups in can
         if (orderData && orderData.employeeId) {
@@ -4012,7 +4052,27 @@ runSetup().then(() => {
 // Fires push alerts to 'all_users' (covering both thambiorutea2 and totemployee) in Indian Standard Time (IST)
 // ============================================
 
-let lastFiredTime = ''; // Format: "YYYY-MM-DD HH:mm"
+const LAST_FIRED_FILE = path.join(__dirname, '.last_fired_time.json');
+
+function getLastFiredTime() {
+    try {
+        if (fs.existsSync(LAST_FIRED_FILE)) {
+            const data = fs.readFileSync(LAST_FIRED_FILE, 'utf8');
+            return JSON.parse(data).lastFiredTime || '';
+        }
+    } catch (err) {
+        console.error('Error reading last fired time file:', err);
+    }
+    return '';
+}
+
+function setLastFiredTime(timeStr) {
+    try {
+        fs.writeFileSync(LAST_FIRED_FILE, JSON.stringify({ lastFiredTime: timeStr }), 'utf8');
+    } catch (err) {
+        console.error('Error writing last fired time file:', err);
+    }
+}
 
 async function sendScheduledPushNotification(title, body) {
     try {
@@ -4061,11 +4121,15 @@ function checkAndSendScheduledNotifications() {
             hour12: false
         });
         
-        // Formatter returns string like "05/30/2026, 22:32"
-        const formatted = formatter.format(now);
-        const [datePart, timePart] = formatted.split(', ');
-        const [month, day, year] = datePart.split('/');
-        const [hour, minute] = timePart.split(':');
+        const parts = formatter.formatToParts(now);
+        let year = '', month = '', day = '', hour = '', minute = '';
+        for (const part of parts) {
+            if (part.type === 'year') year = part.value;
+            if (part.type === 'month') month = part.value;
+            if (part.type === 'day') day = part.value;
+            if (part.type === 'hour') hour = part.value;
+            if (part.type === 'minute') minute = part.value;
+        }
         
         const timeKey = `${hour}:${minute}`; // "HH:mm"
         const fireKey = `${year}-${month}-${day} ${timeKey}`; // "YYYY-MM-DD HH:mm"
@@ -4093,8 +4157,9 @@ function checkAndSendScheduledNotifications() {
             }
         };
 
+        const lastFiredTime = getLastFiredTime();
         if (schedules[timeKey] && lastFiredTime !== fireKey) {
-            lastFiredTime = fireKey;
+            setLastFiredTime(fireKey);
             const promo = schedules[timeKey];
             sendScheduledPushNotification(promo.title, promo.body);
         }
