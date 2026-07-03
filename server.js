@@ -3621,7 +3621,10 @@ app.post('/api/admin/employees/:phone/can-prepared', async (req, res) => {
 // Rider checks their current prepared can status
 app.get('/api/employees/:phone/can-status', async (req, res) => {
     try {
-        const { phone } = req.params;
+        let { phone } = req.params;
+        if (phone && phone.startsWith(' ')) {
+            phone = '+' + phone.trim();
+        }
         let riderStatus = null;
         for (const [_, rider] of onlineRiders.entries()) {
             if (rider.employeePhone === phone) {
@@ -3673,6 +3676,50 @@ app.get('/api/employees/:phone/can-status', async (req, res) => {
         }
     } catch (err) {
         console.error('Fetch Can Status Error:', err);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+// Update rider shift status (start/end shift)
+app.patch('/api/employees/:phone/shift', async (req, res) => {
+    try {
+        let { phone } = req.params;
+        if (phone && phone.startsWith(' ')) {
+            phone = '+' + phone.trim();
+        }
+        const { isShiftActive } = req.body;
+        
+        const snapshot = await db.collection('online_riders').where('employeePhone', '==', phone).get();
+        if (!snapshot.empty) {
+            const docId = snapshot.docs[0].id;
+            await db.collection('online_riders').doc(docId).update({
+                isShiftActive: !!isShiftActive,
+                lastUpdated: new Date().toISOString()
+            });
+            return res.json({ success: true, message: 'Shift status updated' });
+        } else {
+            const result = await ddbDocClient.send(new ScanCommand({
+                TableName: tableName,
+                FilterExpression: 'phone = :phone OR mobile = :phone',
+                ExpressionAttributeValues: { ':phone': phone }
+            }));
+            
+            if (result.Items && result.Items.length > 0) {
+                const emp = result.Items[0];
+                await db.collection('online_riders').doc(emp.empId).set({
+                    employeeId: emp.empId,
+                    employeeName: emp.name,
+                    employeePhone: phone,
+                    isShiftActive: !!isShiftActive,
+                    isOnline: false,
+                    lastUpdated: new Date().toISOString()
+                }, { merge: true });
+                return res.json({ success: true, message: 'Shift status created' });
+            }
+        }
+        res.status(404).json({ success: false, message: 'Employee not found' });
+    } catch (err) {
+        console.error('Update Shift Status Error:', err);
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
