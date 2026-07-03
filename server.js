@@ -90,7 +90,13 @@ async function dispatchToNearbyRiders(orderData) {
         // Query active online riders from Firestore
         const onlineRidersCol = db.collection('online_riders');
         const snapshot = await onlineRidersCol.where('isOnline', '==', true).get();
-        const riders = snapshot.docs.map(doc => doc.data());
+        const now = new Date();
+        const riders = snapshot.docs
+            .map(doc => doc.data())
+            .filter(r => {
+                const lastUpdated = r.lastUpdated ? new Date(r.lastUpdated) : null;
+                return lastUpdated && (now.getTime() - lastUpdated.getTime() < 900000); // 15 minutes limit
+            });
 
         console.log(`🔍 [Geofencing] Checking ${riders.length} online riders in Firestore for Order #${orderData.id}`);
 
@@ -356,13 +362,12 @@ io.on('connection', (socket) => {
             console.log(`⚡ Rider disconnected: ${rider.employeeName} (${rider.employeeId}) | Total online: ${onlineRiders.size - 1}`);
             onlineRiders.delete(socket.id);
 
-            // Sync offline status to Firestore
+            // Sync socket status to Firestore
             try {
                 await db.collection('online_riders').doc(rider.employeeId).update({
-                    isOnline: false,
                     lastUpdated: new Date().toISOString()
                 });
-                console.log(`🔥 [Firestore] Synced OFFLINE (disconnect) for Rider ${rider.employeeId}`);
+                console.log(`🔥 [Firestore] Synced disconnect timestamp for Rider ${rider.employeeId}`);
             } catch (firestoreErr) {
                 console.error(`❌ [Firestore] Error syncing disconnect:`, firestoreErr.message);
             }
@@ -520,31 +525,23 @@ app.post('/api/orders', async (req, res) => {
                 return status === 'delivered' || status === 'placed' || status === 'confirmed';
             });
             
-            // Check first tea eligibility (excluding spin-won free tea orders)
-            const hasReceivedFirstFreeTea = validOrders.some(doc => doc.data().firstTeaFree === true && !doc.data().spinFreeTea);
-            const isFirstTeaEligible = !hasReceivedFirstFreeTea;
-            
-            if (isFirstTeaEligible) {
-                isEligibleForFreeTea = true;
-            } else {
-                // Check spin free tea eligibility
-                const spinDoc = await db.collection('tot_spins').doc(phone).get();
-                if (spinDoc.exists) {
-                    const spinData = spinDoc.data();
-                    const ist = getISTInfo(new Date());
+            // Check spin free tea eligibility
+            const spinDoc = await db.collection('tot_spins').doc(phone).get();
+            if (spinDoc.exists) {
+                const spinData = spinDoc.data();
+                const ist = getISTInfo(new Date());
+                
+                if (spinData.currentWeek === ist.weekIdentifier && spinData.currentWeekWinDay) {
+                    const activeOrdersWithSpinTea = ordersSnapshot.docs.filter(doc => {
+                        const data = doc.data();
+                        const isActiveOrDelivered = data.status === 'delivered' || data.status === 'placed' || data.status === 'confirmed';
+                        const isThisWeek = getWeekIdentifierOfDate(new Date(data.createdAt)) === ist.weekIdentifier;
+                        return isActiveOrDelivered && isThisWeek && data.spinFreeTea === true;
+                    });
                     
-                    if (spinData.currentWeek === ist.weekIdentifier && spinData.currentWeekWinDay) {
-                        const activeOrdersWithSpinTea = ordersSnapshot.docs.filter(doc => {
-                            const data = doc.data();
-                            const isActiveOrDelivered = data.status === 'delivered' || data.status === 'placed' || data.status === 'confirmed';
-                            const isThisWeek = getWeekIdentifierOfDate(new Date(data.createdAt)) === ist.weekIdentifier;
-                            return isActiveOrDelivered && isThisWeek && data.spinFreeTea === true;
-                        });
-                        
-                        if (activeOrdersWithSpinTea.length === 0) {
-                            isEligibleForFreeTea = true;
-                            isSpinFreeTea = true;
-                        }
+                    if (activeOrdersWithSpinTea.length === 0) {
+                        isEligibleForFreeTea = true;
+                        isSpinFreeTea = true;
                     }
                 }
             }
@@ -1135,14 +1132,31 @@ app.post('/api/orders/:id/accept', async (req, res) => {
     }
 });
 
-// Get online riders (for admin panel)
-app.get('/api/riders/online', (req, res) => {
-    const riders = getOnlineRidersArray();
-    res.json({
-        success: true,
-        count: riders.length,
-        data: riders
-    });
+// Get online riders (for admin panel and client app)
+app.get('/api/riders/online', async (req, res) => {
+    try {
+        const snapshot = await db.collection('online_riders').where('isOnline', '==', true).get();
+        const now = new Date();
+        const riders = [];
+
+        snapshot.forEach(doc => {
+            const data = doc.data();
+            const lastUpdated = data.lastUpdated ? new Date(data.lastUpdated) : null;
+            // 15 minutes limit (900,000 ms)
+            if (lastUpdated && (now.getTime() - lastUpdated.getTime() < 900000)) {
+                riders.push(data);
+            }
+        });
+
+        res.json({
+            success: true,
+            count: riders.length,
+            data: riders
+        });
+    } catch (err) {
+        console.error('Error fetching online riders:', err);
+        res.status(500).json({ success: false, message: 'Failed to fetch online riders' });
+    }
 });
 
 // Update order status (Confirmed -> Delivered)
@@ -1155,11 +1169,15 @@ app.patch('/api/orders/:id/status', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Invalid status update' });
         }
 
-        await ordersCol.doc(orderId).update({
+        const updateData = {
             status: 'delivered',
             updatedAt: new Date().toISOString(),
             deliveredAt: new Date().toISOString()
-        });
+        };
+        if (req.body.paymentMode) {
+            updateData.paymentMode = req.body.paymentMode;
+        }
+        await ordersCol.doc(orderId).update(updateData);
 
         const updatedDoc = await ordersCol.doc(orderId).get();
         const orderData = updatedDoc.data();
@@ -1167,10 +1185,15 @@ app.patch('/api/orders/:id/status', async (req, res) => {
         // ☕ Decrement employee remaining tea cups in can
         if (orderData && orderData.employeeId) {
             let teaCount = 0;
+            let mlCount = 0;
             orderData.items?.forEach(item => {
                 const name = item.name.toLowerCase();
                 if (name.includes('tea') || name.includes('coffee')) {
-                    teaCount += (item.quantity || 1);
+                    const quantity = item.quantity || 1;
+                    const isSmall = item.price === 10 || name.includes('small');
+                    const volume = isSmall ? 90 : 130;
+                    mlCount += quantity * volume;
+                    teaCount += quantity;
                 }
             });
 
@@ -1180,15 +1203,19 @@ app.patch('/api/orders/:id/status', async (req, res) => {
                     const riderDoc = await riderRef.get();
                     if (riderDoc.exists) {
                         const rData = riderDoc.data();
-                        const currentCups = rData.teaCups !== undefined ? rData.teaCups : 120;
-                        const newTeaCups = Math.max(0, currentCups - teaCount);
+                        const currentCups = rData.teaCups !== undefined ? rData.teaCups : 4500; // default to 4500 ml flask capacity
+                        const newTeaCups = Math.max(0, currentCups - mlCount);
                         const newTeasSold = (rData.teasSold || 0) + teaCount;
                         const newTotalTeasSold = (rData.totalTeasSold || 0) + teaCount;
+                        
+                        const orderAmount = orderData.totalAmount || 0;
+                        const newTotalSalesAmount = (rData.totalSalesAmount || 0) + orderAmount;
 
                         await riderRef.update({
                             teaCups: newTeaCups,
                             teasSold: newTeasSold,
                             totalTeasSold: newTotalTeasSold,
+                            totalSalesAmount: newTotalSalesAmount,
                             lastUpdated: new Date().toISOString()
                         });
 
@@ -1198,6 +1225,7 @@ app.patch('/api/orders/:id/status', async (req, res) => {
                                 activeRider.teaCups = newTeaCups;
                                 activeRider.teasSold = newTeasSold;
                                 activeRider.totalTeasSold = newTotalTeasSold;
+                                activeRider.totalSalesAmount = newTotalSalesAmount;
                                 onlineRiders.set(sId, activeRider);
                                 break;
                             }
@@ -1303,36 +1331,74 @@ app.patch('/api/admin/orders/:id/status', async (req, res) => {
         res.status(500).json({ success: false, message: 'Failed to update status' });
     }
 });
-
 // Record offline sale for an employee (updates Firestore inventory in real-time)
 app.post('/api/employees/:employeeId/offline-sale', async (req, res) => {
     try {
         const { employeeId } = req.params;
-        const { cupsSold, paymentMode } = req.body;
+        const { cupsSold, paymentMode, teaName, price } = req.body;
 
         if (!cupsSold || cupsSold <= 0) {
             return res.status(400).json({ success: false, message: 'Cups sold must be greater than 0' });
         }
 
         const riderRef = db.collection('online_riders').doc(employeeId);
-        const riderDoc = await riderRef.get();
+        let riderDoc = await riderRef.get();
+
+        if (!riderDoc.exists) {
+            console.log(`⚠️ [Offline Sale] Rider document not found in Firestore for ${employeeId}. Querying DynamoDB...`);
+            const result = await ddbDocClient.send(new ScanCommand({
+                TableName: tableName,
+                FilterExpression: 'empId = :empId',
+                ExpressionAttributeValues: { ':empId': employeeId }
+            }));
+
+            if (result.Items && result.Items.length > 0) {
+                const empItem = result.Items[0];
+                const initialRiderData = {
+                    employeeId: empItem.empId,
+                    employeeName: empItem.name || 'Rider',
+                    employeePhone: empItem.phone || '',
+                    isOnline: false,
+                    teaCups: 4500,
+                    teasSold: 0,
+                    totalTeasSold: 0,
+                    totalSalesAmount: 0,
+                    lastUpdated: new Date().toISOString()
+                };
+                await riderRef.set(initialRiderData);
+                riderDoc = await riderRef.get();
+                console.log(`✅ [Offline Sale] Auto-created online_riders document for ${employeeId}`);
+            } else {
+                return res.status(404).json({ success: false, message: 'Employee not found in records' });
+            }
+        }
 
         if (riderDoc.exists) {
             const rData = riderDoc.data();
-            const currentCups = rData.teaCups !== undefined ? rData.teaCups : 120;
-            const newTeaCups = Math.max(0, currentCups - cupsSold);
+            const currentCups = rData.teaCups !== undefined ? rData.teaCups : 4500; // default to 4500 ml flask capacity
+            const isSmall = price === 10 || (teaName && teaName.toLowerCase().includes('small'));
+            const unitVolume = isSmall ? 90 : 130;
+            const volumeSold = cupsSold * unitVolume;
+            const newTeaCups = Math.max(0, currentCups - volumeSold);
             const newTeasSold = (rData.teasSold || 0) + cupsSold;
             const newTotalTeasSold = (rData.totalTeasSold || 0) + cupsSold;
+            
+            const saleAmount = cupsSold * (price !== undefined ? price : 15);
+            const newTotalSalesAmount = (rData.totalSalesAmount || 0) + saleAmount;
 
             await riderRef.update({
                 teaCups: newTeaCups,
                 teasSold: newTeasSold,
                 totalTeasSold: newTotalTeasSold,
+                totalSalesAmount: newTotalSalesAmount,
                 lastUpdated: new Date().toISOString()
             });
 
             // Record the offline sale as a completed order in tot_orders for detailed tracking
             const offlineOrderId = `OFF-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
+            const itemPrice = price !== undefined ? price : 15;
+            const itemName = teaName || 'Premium Tea (Offline)';
+
             const offlineOrderData = {
                 id: offlineOrderId,
                 status: 'delivered',
@@ -1343,13 +1409,14 @@ app.post('/api/employees/:employeeId/offline-sale', async (req, res) => {
                 customerPhone: 'N/A',
                 createdAt: new Date().toISOString(),
                 updatedAt: new Date().toISOString(),
-                totalAmount: cupsSold * 15,
+                totalAmount: cupsSold * itemPrice,
                 paymentMode: paymentMode === 'upi' ? 'online' : 'cod',
                 paymentStatus: 'paid',
                 firstTeaFree: false,
                 isOfflineSale: true,
-                items: [{ name: 'Flask Tea (Offline)', quantity: cupsSold, price: 15 }]
+                items: [{ name: itemName, quantity: cupsSold, price: itemPrice }]
             };
+
             await ordersCol.doc(offlineOrderId).set(offlineOrderData);
 
             // Update in-memory map so Socket.io admin broadcasts get the new inventory count instantly
@@ -1358,6 +1425,7 @@ app.post('/api/employees/:employeeId/offline-sale', async (req, res) => {
                     activeRider.teaCups = newTeaCups;
                     activeRider.teasSold = newTeasSold;
                     activeRider.totalTeasSold = newTotalTeasSold;
+                    activeRider.totalSalesAmount = newTotalSalesAmount;
                     onlineRiders.set(sId, activeRider);
                     break;
                 }
@@ -1407,15 +1475,8 @@ app.get('/api/orders/customer/:phone/free-tea-eligibility', async (req, res) => 
             const data = doc.data();
             return data.status === 'delivered' || data.status === 'placed' || data.status === 'confirmed';
         });
-        
-        // 1. First Tea Free
-        const hasReceivedFirstFreeTea = validOrders.some(doc => doc.data().firstTeaFree === true && !doc.data().spinFreeTea);
-        const isFirstTeaEligible = !hasReceivedFirstFreeTea;
-        
-        if (isFirstTeaEligible) {
-            return res.json({ success: true, eligible: true, type: 'first_tea' });
-        }
-        
+        // 1. First Tea Free (REMOVED)
+        // first tea free is no longer offered to first-time logins.
         // 2. Check Spin Free Tea
         const spinDoc = await db.collection('tot_spins').doc(phone).get();
         if (spinDoc.exists) {
@@ -2188,6 +2249,105 @@ app.get('/api/auth/me/:empId', async (req, res) => {
     }
 });
 
+// ============================================
+// REGULAR CUSTOMERS ENDPOINTS
+// ============================================
+app.post('/api/employee/regular-customers', async (req, res) => {
+    try {
+        const { name, phone, location, scheduleType, date, recurringDays, time, employeeId } = req.body;
+        if (!name || !phone || !location || !time || !employeeId) {
+            return res.status(400).json({ success: false, message: 'All fields are required' });
+        }
+
+        const newCustomer = {
+            name,
+            phone,
+            location,
+            scheduleType: scheduleType || 'one_time',
+            date: date || '',
+            recurringDays: recurringDays || [],
+            time,
+            employeeId,
+            createdAt: new Date().toISOString()
+        };
+
+        const docRef = await db.collection('tot_regular_customers').add(newCustomer);
+        res.json({ success: true, id: docRef.id, customer: newCustomer });
+    } catch (error) {
+        console.error('Error adding regular customer:', error);
+        res.status(500).json({ success: false, message: 'Failed to save customer' });
+    }
+});
+
+app.get('/api/employee/regular-customers/:employeeId', async (req, res) => {
+    try {
+        const { employeeId } = req.params;
+        const snapshot = await db.collection('tot_regular_customers')
+            .where('employeeId', '==', employeeId)
+            .get();
+
+        const list = snapshot.docs.map(doc => ({
+            id: doc.id,
+            ...doc.data()
+        }));
+
+        res.json({ success: true, customers: list });
+    } catch (error) {
+        console.error('Error getting regular customers:', error);
+        res.status(500).json({ success: false, message: 'Failed to retrieve customers' });
+    }
+});
+
+app.post('/api/employee/regular-customers/:id/complete', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const todayStr = new Date().toISOString().split('T')[0];
+        
+        await db.collection('tot_regular_customers').doc(id).update({
+            lastCompletedDate: todayStr
+        });
+        
+        const doc = await db.collection('tot_regular_customers').doc(id).get();
+        const customerData = doc.data();
+        
+        const completionRecord = {
+            customerId: id,
+            name: customerData.name,
+            phone: customerData.phone,
+            location: customerData.location,
+            employeeId: customerData.employeeId,
+            completedAt: new Date().toISOString(),
+            date: todayStr,
+            type: 'regular_visit'
+        };
+        
+        await db.collection('tot_regular_completions').add(completionRecord);
+        res.json({ success: true, message: 'Customer marked completed' });
+    } catch (error) {
+        console.error('Error completing customer:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+app.get('/api/employee/regular-completions/:employeeId', async (req, res) => {
+    try {
+        const { employeeId } = req.params;
+        const snapshot = await db.collection('tot_regular_completions')
+            .where('employeeId', '==', employeeId)
+            .get();
+            
+        const list = snapshot.docs.map(doc => ({
+            id: doc.id,
+            ...doc.data()
+        }));
+        
+        res.json({ success: true, completions: list });
+    } catch (error) {
+        console.error('Error fetching completions:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
 // Get employee stats (mock implementation)
 // Get employee stats (Production Live Implementation)
 app.get('/api/employee/stats/:empId', async (req, res) => {
@@ -2210,11 +2370,13 @@ app.get('/api/employee/stats/:empId', async (req, res) => {
 
         // 2. Gather active rider session if online
         let activeSales = 0;
+        let activeSalesAmount = 0;
         let activeRider = null;
         for (const [_, rider] of onlineRiders.entries()) {
             if (rider.employeeId === empId) {
                 activeRider = rider;
                 activeSales = rider.totalTeasSold || 0;
+                activeSalesAmount = rider.totalSalesAmount || 0;
                 break;
             }
         }
@@ -2272,56 +2434,40 @@ app.get('/api/employee/stats/:empId', async (req, res) => {
             }
         });
 
-        // 5. Calculate earnings based on employee type
-        const isPartTime = employee.employeeType === 'Part Time';
-        const rate = 2.50;
+        // 5. Calculate earnings based on daily commission rules (resets every shift/day)
+        const getEarningForAmount = (amount) => {
+            const amt = parseFloat(amount || 0);
+            return amt < 3500 ? amt * 0.25 : amt * 0.30;
+        };
 
-        if (isPartTime) {
-            todayEarnings = todayTeas * rate;
-            weeklyEarnings = weeklyTeas * rate;
-            monthlyEarnings = monthlyTeas * rate;
-        } else {
-            // Full-time: Check today's incentive
-            const todayStr = now.toISOString().split('T')[0];
-            const todayLog = workHistory[todayStr];
-            if (todayLog) {
-                todayEarnings = todayLog.incentiveEarned === true ? 250 : 0;
-            } else {
-                // If they are still online
-                let timeElapsedMs = 0;
-                if (activeRider && activeRider.onlineSince) {
-                    timeElapsedMs = Date.now() - new Date(activeRider.onlineSince).getTime();
-                }
-                todayEarnings = (todayTeas >= 360 && timeElapsedMs > 0 && timeElapsedMs <= 6 * 60 * 60 * 1000) ? 250 : 0;
-            }
-            
-            // For weekly/monthly, check dynamic achieved dates
-            weeklyEarnings = 0;
-            monthlyEarnings = 0;
-            
-            Object.keys(workHistory).forEach(dateStr => {
-                if (dateStr === todayStr) return; // skip today as it's active or handled separately
-                const log = workHistory[dateStr];
-                const dateObj = new Date(dateStr);
-                const sales = parseInt(log.sales || 0, 10);
-                
-                // Parse duration or check log.incentiveEarned
-                const hitTarget = log.incentiveEarned === true || (sales >= 360 && (!log.duration || !log.duration.includes('h') || parseFloat(log.duration.split('h')[0]) < 6 || (parseFloat(log.duration.split('h')[0]) === 6 && parseFloat(log.duration.split('h')[1].replace('m','').trim()) === 0)));
+        const todayStr = now.toISOString().split('T')[0];
+        const todayLog = workHistory[todayStr];
+        let todaySalesAmount = activeSalesAmount;
 
-                if (dateObj >= startOfWeek) {
-                    if (hitTarget) weeklyEarnings += 250;
-                }
-                if (dateObj >= startOfMonth) {
-                    if (hitTarget) monthlyEarnings += 250;
-                }
-            });
-            
-            // Include today's shift incentive in aggregates
-            if (todayEarnings >= 250) {
-                weeklyEarnings += 250;
-                monthlyEarnings += 250;
-            }
+        if (todayLog) {
+            todaySalesAmount = parseFloat(todayLog.salesAmount !== undefined ? todayLog.salesAmount : (todayLog.sales * 15));
         }
+        todayEarnings = getEarningForAmount(todaySalesAmount);
+
+        // Weekly and Monthly earnings are the sum of daily earnings
+        weeklyEarnings = todayEarnings;
+        monthlyEarnings = todayEarnings;
+
+        Object.keys(workHistory).forEach(dateStr => {
+            if (dateStr === todayStr) return; // already counted in todayEarnings
+            const log = workHistory[dateStr];
+            const dateObj = new Date(dateStr);
+            const sales = parseInt(log.sales || 0, 10);
+            const salesAmt = parseFloat(log.salesAmount !== undefined ? log.salesAmount : (sales * 15));
+            const dayEarning = getEarningForAmount(salesAmt);
+
+            if (dateObj >= startOfWeek) {
+                weeklyEarnings += dayEarning;
+            }
+            if (dateObj >= startOfMonth) {
+                monthlyEarnings += dayEarning;
+            }
+        });
 
         res.json({
             success: true,
@@ -3839,6 +3985,16 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
 function toRad(deg) {
     return deg * (Math.PI / 180);
 }
+
+// Global Express Error Handler
+app.use((err, req, res, next) => {
+    if (err.message === 'Request aborted') {
+        console.warn(`⚠️ [Multer] Request aborted by client: ${req.method} ${req.path}`);
+        return res.status(499).json({ success: false, message: 'Client closed connection before upload completed' });
+    }
+    console.error('❌ Express Error:', err.stack || err.message);
+    res.status(500).json({ success: false, message: err.message || 'Internal Server Error' });
+});
 
 // Start server
 runSetup().then(() => {
