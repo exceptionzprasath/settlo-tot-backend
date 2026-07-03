@@ -3628,7 +3628,17 @@ app.get('/api/employees/:phone/can-status', async (req, res) => {
                 riderStatus = {
                     canRequestStatus: rider.canRequestStatus || 'none',
                     preparedCanId: rider.preparedCanId || null,
-                    canHistory: rider.canHistory || []
+                    canHistory: rider.canHistory || [],
+                    flasks: rider.flasks || [],
+                    activeFlaskIndex: rider.activeFlaskIndex !== undefined ? rider.activeFlaskIndex : -1,
+                    totalSalesAmount: rider.totalSalesAmount || 0,
+                    teaCups: rider.teaCups !== undefined ? rider.teaCups : 4500,
+                    teasSold: rider.teasSold || 0,
+                    totalTeasSold: rider.totalTeasSold || 0,
+                    boxNumber: rider.boxNumber || 'Flask',
+                    currentCan: rider.currentCan || '',
+                    canIndex: rider.canIndex || 1,
+                    isShiftActive: rider.isShiftActive || false
                 };
                 break;
             }
@@ -3641,7 +3651,17 @@ app.get('/api/employees/:phone/can-status', async (req, res) => {
                 riderStatus = {
                     canRequestStatus: rData.canRequestStatus || 'none',
                     preparedCanId: rData.preparedCanId || null,
-                    canHistory: rData.canHistory || []
+                    canHistory: rData.canHistory || [],
+                    flasks: rData.flasks || [],
+                    activeFlaskIndex: rData.activeFlaskIndex !== undefined ? rData.activeFlaskIndex : -1,
+                    totalSalesAmount: rData.totalSalesAmount || 0,
+                    teaCups: rData.teaCups !== undefined ? rData.teaCups : 4500,
+                    teasSold: rData.teasSold || 0,
+                    totalTeasSold: rData.totalTeasSold || 0,
+                    boxNumber: rData.boxNumber || 'Flask',
+                    currentCan: rData.currentCan || '',
+                    canIndex: rData.canIndex || 1,
+                    isShiftActive: rData.isShiftActive || false
                 };
             }
         }
