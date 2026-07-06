@@ -1295,8 +1295,9 @@ app.patch('/api/admin/orders/:id/status', async (req, res) => {
         const { status } = req.body;
         const orderId = req.params.id;
 
-        if (!['confirmed', 'delivered', 'expired', 'unassigned'].includes(status)) {
-            return res.status(400).json({ success: false, message: 'Invalid status update. Allowed: confirmed, delivered, expired, unassigned' });
+        const allowedStatuses = ['placed', 'accepted', 'confirmed', 'preparing', 'on_the_way', 'delivered', 'cancelled', 'expired', 'unassigned'];
+        if (!allowedStatuses.includes(status)) {
+            return res.status(400).json({ success: false, message: `Invalid status update. Allowed: ${allowedStatuses.join(', ')}` });
         }
 
         const updateData = {
@@ -1304,10 +1305,12 @@ app.patch('/api/admin/orders/:id/status', async (req, res) => {
             updatedAt: new Date().toISOString()
         };
 
-        if (status === 'confirmed') {
+        if (status === 'confirmed' || status === 'preparing') {
             updateData.confirmedAt = new Date().toISOString();
         } else if (status === 'delivered') {
             updateData.deliveredAt = new Date().toISOString();
+        } else if (status === 'cancelled') {
+            updateData.cancelledAt = new Date().toISOString();
         }
 
         await ordersCol.doc(orderId).update(updateData);
@@ -1322,18 +1325,34 @@ app.patch('/api/admin/orders/:id/status', async (req, res) => {
                 status,
                 order: orderData
             });
+            
+            // Send customer push notifications for critical transitions
+            if (status === 'cancelled') {
+                sendCustomerPushNotification(
+                    orderData.customerPhone,
+                    'Order Cancelled ❌',
+                    `Your order #${orderId} was cancelled by the store admin.`
+                );
+            } else if (status === 'delivered') {
+                sendCustomerPushNotification(
+                    orderData.customerPhone,
+                    'Order Delivered ☕',
+                    `Your order #${orderId} was marked as delivered. Enjoy your tea!`
+                );
+            }
+
             console.log(`📤 Notified customer ${orderData.customerPhone} of status override: ${status}`);
         }
         
         io.to('admin').emit('order_update', { orderId, status, order: orderData });
 
-        // Trigger automatic Razorpay Refund if status set to expired or unassigned
-        if ((status === 'expired' || status === 'unassigned') && orderData.paymentMode === 'online' && orderData.paymentStatus === 'paid' && orderData.razorpayPaymentId) {
+        // Trigger automatic Razorpay Refund if status set to expired, unassigned or cancelled
+        if ((status === 'expired' || status === 'unassigned' || status === 'cancelled') && orderData.paymentMode === 'online' && orderData.paymentStatus === 'paid' && orderData.razorpayPaymentId) {
             try {
                 console.log(`💸 [Refund] Corporate manager initiated refund for Order #${orderId} (Payment ID: ${orderData.razorpayPaymentId})...`);
                 const refundResponse = await razorpay.payments.refund(orderData.razorpayPaymentId, {
                     notes: {
-                        reason: "Order declined by Corporate Manager",
+                        reason: `Order set to ${status} by Corporate Manager`,
                         orderId: orderId
                     }
                 });
