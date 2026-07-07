@@ -3316,25 +3316,44 @@ app.get('/api/admin/employees/active', async (req, res) => {
             return res.json({ success: true, count: activeEmployeesCache.length, data: activeEmployeesCache });
         }
 
-        const result = await ddbDocClient.send(new ScanCommand({
-            TableName: tableName,
-            FilterExpression: '#role = :role AND (#status = :status OR #status = :suspendedStatus)',
-            ExpressionAttributeNames: {
-                '#role': 'role',
-                '#status': 'status'
-            },
-            ExpressionAttributeValues: {
-                ':role': 'employee',
-                ':status': 'active',
-                ':suspendedStatus': 'suspended'
-            }
-        }));
+        let allItems = [];
+        let lastEvaluatedKey = undefined;
 
-        const items = result.Items || [];
-        activeEmployeesCache = items;
+        do {
+            const params = {
+                TableName: tableName,
+                FilterExpression: '#role = :role AND (#status = :status OR #status = :suspendedStatus)',
+                ExpressionAttributeNames: {
+                    '#role': 'role',
+                    '#status': 'status'
+                },
+                ExpressionAttributeValues: {
+                    ':role': 'employee',
+                    ':status': 'active',
+                    ':suspendedStatus': 'suspended'
+                }
+            };
+
+            if (lastEvaluatedKey) {
+                params.ExclusiveStartKey = lastEvaluatedKey;
+            }
+
+            const result = await ddbDocClient.send(new ScanCommand(params));
+            if (result.Items) {
+                allItems = allItems.concat(result.Items);
+            }
+            lastEvaluatedKey = result.LastEvaluatedKey;
+
+            if (lastEvaluatedKey) {
+                // Delay 150ms between pages to respect low provisioned RCUs (5 RCUs)
+                await new Promise(resolve => setTimeout(resolve, 150));
+            }
+        } while (lastEvaluatedKey);
+
+        activeEmployeesCache = allItems;
         activeEmployeesCacheTime = Date.now();
 
-        res.json({ success: true, count: items.length, data: items });
+        res.json({ success: true, count: allItems.length, data: allItems });
     } catch (err) {
         console.error('Fetch Active Employees Error:', err);
         res.status(500).json({ success: false, message: 'Failed to fetch active employees' });
@@ -3439,20 +3458,40 @@ app.get('/api/admin/employees/:phone/history', async (req, res) => {
 // Get pending employee applications
 app.get('/api/admin/applications/pending', async (req, res) => {
     try {
-        const result = await ddbDocClient.send(new ScanCommand({
-            TableName: tableName,
-            FilterExpression: '#role = :role AND #status = :status',
-            ExpressionAttributeNames: {
-                '#role': 'role',
-                '#status': 'status'
-            },
-            ExpressionAttributeValues: {
-                ':role': 'employee',
-                ':status': 'pending_verification'
-            }
-        }));
+        let allItems = [];
+        let lastEvaluatedKey = undefined;
 
-        res.json({ success: true, count: result.Items ? result.Items.length : 0, data: result.Items || [] });
+        do {
+            const params = {
+                TableName: tableName,
+                FilterExpression: '#role = :role AND #status = :status',
+                ExpressionAttributeNames: {
+                    '#role': 'role',
+                    '#status': 'status'
+                },
+                ExpressionAttributeValues: {
+                    ':role': 'employee',
+                    ':status': 'pending_verification'
+                }
+            };
+
+            if (lastEvaluatedKey) {
+                params.ExclusiveStartKey = lastEvaluatedKey;
+            }
+
+            const result = await ddbDocClient.send(new ScanCommand(params));
+            if (result.Items) {
+                allItems = allItems.concat(result.Items);
+            }
+            lastEvaluatedKey = result.LastEvaluatedKey;
+
+            if (lastEvaluatedKey) {
+                // Delay 150ms between pages to respect low provisioned RCUs (5 RCUs)
+                await new Promise(resolve => setTimeout(resolve, 150));
+            }
+        } while (lastEvaluatedKey);
+
+        res.json({ success: true, count: allItems.length, data: allItems });
     } catch (err) {
         console.error('Fetch Applications Error:', err);
         res.status(500).json({ success: false, message: 'Failed to fetch applications' });
