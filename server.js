@@ -2615,6 +2615,18 @@ app.delete('/api/admin/dispatches/:id', async (req, res) => {
     }
 });
 
+// Delete an order (for super admin access)
+app.delete('/api/admin/orders/:id', async (req, res) => {
+    try {
+        const orderId = req.params.id;
+        await ordersCol.doc(orderId).delete();
+        res.json({ success: true, message: 'Order deleted successfully' });
+    } catch (err) {
+        console.error('Delete Order Error:', err);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
 // --- Admin Routes ---
 
 // Get all orders (for admin panel, with pagination and filtering)
