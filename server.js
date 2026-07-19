@@ -2661,6 +2661,8 @@ app.get('/api/admin/orders', async (req, res) => {
             });
         }
 
+        const monthlyBaseOrders = [...filteredOrders];
+
         // 1. Status Filter
         if (statusFilter) {
             filteredOrders = filteredOrders.filter(o => o.status === statusFilter);
@@ -2728,6 +2730,19 @@ app.get('/api/admin/orders', async (req, res) => {
             });
         }
 
+        // Calculate Current Month Revenue (in IST)
+        const currentIST = getISTInfo(new Date());
+        const currentYear = currentIST.year;
+        const currentMonth = currentIST.month;
+        const currentMonthRevenue = monthlyBaseOrders
+            .filter(o => {
+                if (o.status !== 'delivered') return false;
+                if (!o.createdAt) return false;
+                const orderIST = getISTInfo(new Date(o.createdAt));
+                return orderIST.year === currentYear && orderIST.month === currentMonth;
+            })
+            .reduce((sum, o) => sum + (parseFloat(o.totalAmount) || 0), 0);
+
         // Compute summary stats over the filtered subset of orders
         const totalOrders = filteredOrders.length;
         const activeOrders = filteredOrders.filter(o => ['placed', 'accepted', 'preparing', 'on_the_way', 'confirmed'].includes(o.status)).length;
@@ -2750,7 +2765,8 @@ app.get('/api/admin/orders', async (req, res) => {
             summary: {
                 totalOrders,
                 activeOrders,
-                totalRevenue: Math.round(totalRevenue)
+                totalRevenue: Math.round(totalRevenue),
+                currentMonthRevenue: Math.round(currentMonthRevenue)
             },
             data: paginatedOrders
         });
